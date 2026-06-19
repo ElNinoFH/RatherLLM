@@ -161,7 +161,7 @@ namespace ratherllm {
         // Stop the decode thread and release all resources (idempotent).
         void shutdown();
 
-        bool running() const noexcept { return running_.load(std::memory_order_acquire); }
+        bool running() const noexcept;
 
     private:
         struct Impl;                 // hides STL-heavy state from the header

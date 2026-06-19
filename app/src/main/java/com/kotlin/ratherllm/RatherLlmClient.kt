@@ -11,7 +11,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.currentCoroutineContext
 import java.util.concurrent.atomic.AtomicLong
 
 /** Sampling / generation parameters mirrored to the native GenerateRequest payload. */
@@ -58,7 +58,7 @@ class RatherLlmClient(
         private const val FLAG_FINAL: Int = 0x1
 
         private const val HEADER_BYTES: Int = 12
-        private const val MAX_PAYLOAD: Int = 1 sh 20 // 1 MiB hard cap (defensive)
+        private const val MAX_PAYLOAD: Int = 1 shl 20 // 1 MiB hard cap (defensive)
 
         private val requestCounter = AtomicLong(0L)
     }
@@ -89,7 +89,7 @@ class RatherLlmClient(
             // Read the token stream.
             val header = ByteArray(HEADER_BYTES)
             while (true) {
-                coroutineContext.ensureActive() // cooperative cancellation
+                currentCoroutineContext().ensureActive() // cooperative cancellation
 
                 if (!input.readFully(header, HEADER_BYTES)) break // peer closed
 
@@ -99,7 +99,7 @@ class RatherLlmClient(
                 val type = hb.short.toInt() and 0xFFFF
                 val flags = hb.short.toInt() and 0xFFFF
                 val payloadLen = hb.int
-                if (payloadLen < 0 || payloadLen > MAX_PAYLOAD) {
+                if (payloadLen !in 0..MAX_PAYLOAD) {
                     throw IOException("protocol error: payload_len=$payloadLen")
                 }
 

@@ -980,17 +980,20 @@ namespace ratherllm {
     }
 
     void MllmEngine::shutdown() {
-        if (!impl_) return;
-        const bool was = impl_->running.exchange(false, std::memory_order_acq_rel);
-        if (was) impl_->q_cv.notify_all();
-        if (impl_->decode_thread.joinable()) impl_->decode_thread.join();
+        if (!impl_ || !impl_->running.load(std::memory_order_acquire)) return;
 
-        // Invariant 3: leak-free teardown (munlock + munmap + fd close handled by
-        // the arena's RAII release; KV cache freed with the vectors).
+        impl_->running.store(false, std::memory_order_release);
+        impl_->q_cv.notify_all();
+
+        if (impl_->decode_thread.joinable()) {
+            impl_->decode_thread.join();
+        }
+
         impl_->arena.release();
-        impl_->k_cache.clear(); impl_->k_cache.shrink_to_fit();
-        impl_->v_cache.clear(); impl_->v_cache.shrink_to_fit();
-        if (was) RLLM_LOGI("engine shut down cleanly");
+    }
+
+    bool MllmEngine::running() const noexcept {
+        return impl_ && impl_->running.load(std::memory_order_acquire);
     }
 
 } // namespace ratherllm

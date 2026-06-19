@@ -190,4 +190,15 @@ Java_com_kotlin_ratherllm_NativeBridge_isRunning(JNIEnv* /*env*/, jobject /*thiz
     return g_running.load(std::memory_order_acquire) ? JNI_TRUE : JNI_FALSE;
 }
 
+// -----------------------------------------------------------------------------
+//  stringFromJNI() -> String
+// -----------------------------------------------------------------------------
+JNIEXPORT jstring JNICALL
+Java_com_kotlin_ratherllm_MainActivity_stringFromJNI(JNIEnv* env, jobject /*thiz*/) {
+    const bool up = g_running.load(std::memory_order_acquire);
+    const std::string msg = up ? "ratherllm engine: running"
+                               : "ratherllm engine: idle";
+    return env->NewStringUTF(msg.c_str());
+}
+
 } // extern "C"

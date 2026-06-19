@@ -1,5 +1,6 @@
 package com.kotlin.ratherllm
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,13 +8,14 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Binder
-import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -26,21 +28,13 @@ import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Foreground service that owns the lifetime of the native ratherllm engine.
- *
- * Responsibilities:
- *  - Promote the process into a high-importance bucket via a persistent
- *    foreground notification so HyperOS's PSI/LMK governance does not reclaim it.
- *  - Drive [NativeBridge.startEngine] / [NativeBridge.stopEngine] off the main thread.
- *  - Hold a partial wake lock so the pinned decode thread keeps running with the
- *    screen off.
- *  - Expose the token [Flow] to the UI via a bound [LocalBinder].
+ * Foreground service that owns the lifetime of the native ratherllm engine and
+ * keeps the process in a high-importance bucket so HyperOS does not reclaim it.
  */
 class InferenceService : Service() {
 
     enum class Status { Idle, Starting, Ready, Error }
 
-    /** Binder handed to bound clients (the UI / ViewModel). */
     inner class LocalBinder : Binder() {
         val service: InferenceService get() = this@InferenceService
     }
@@ -67,14 +61,11 @@ class InferenceService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_STOP -> {
-                stopSelfClean()
-                return START_NOT_STICKY
-            }
+        if (intent?.action == ACTION_STOP) {
+            stopSelfClean()
+            return START_NOT_STICKY
         }
 
-        // Must enter the foreground promptly (well under the ANR window).
         startForegroundCompat(buildNotification("Starting inference engine…"))
 
         if (started.compareAndSet(false, true)) {
@@ -83,8 +74,6 @@ class InferenceService : Service() {
             acquireWakeLock()
             launchEngine(modelPath, useNeuropilot)
         }
-
-        // STICKY so the platform restarts us if we are ever killed under pressure.
         return START_STICKY
     }
 
@@ -96,18 +85,8 @@ class InferenceService : Service() {
         super.onDestroy()
     }
 
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        // Keep running even if the task is swiped away; the engine is the point.
-        super.onTaskRemoved(rootIntent)
-    }
-
     // ---- Public API for bound clients --------------------------------------
 
-    /**
-     * Stream tokens for [prompt]. Delegates to the UDS client, which connects to
-     * the already-running native engine over the abstract socket. Cold Flow:
-     * each collection opens its own connection and is fully cancellable.
-     */
     fun streamTokens(prompt: String, params: GenParams = GenParams()): Flow<TokenChunk> =
         client.streamTokens(prompt, params)
 
@@ -124,8 +103,12 @@ class InferenceService : Service() {
                 fail("no model path provided")
                 return@launch
             }
-            val rc = runCatching { NativeBridge.startEngine(modelPath, useNeuropilot) }
-                .getOrElse { t -> fail("startEngine threw: ${t.message}"); return@launch }
+            val rc = try {
+                NativeBridge.startEngine(modelPath, useNeuropilot)
+            } catch (e: Throwable) {
+                fail("startEngine threw: ${e.message}")
+                return@launch
+            }
 
             if (rc == 0 && NativeBridge.isRunning()) {
                 _status.value = Status.Ready
@@ -163,7 +146,7 @@ class InferenceService : Service() {
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKELOCK_TAG).apply {
             setReferenceCounted(false)
-            acquire()
+            acquire(WAKELOCK_TIMEOUT_MS) // bounded so the OS can reclaim a leaked lock
         }
     }
 
@@ -175,18 +158,16 @@ class InferenceService : Service() {
     // ---- Notification -------------------------------------------------------
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "On-device AI Inference",
-                NotificationManager.IMPORTANCE_LOW, // low => no sound, still ongoing
-            ).apply {
-                description = "Keeps the local LLM engine resident and responsive."
-                setShowBadge(false)
-            }
-            val nm = getSystemService(NotificationManager::class.java)
-            nm.createNotificationChannel(channel)
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "On-device AI Inference",
+            NotificationManager.IMPORTANCE_LOW,
+        ).apply {
+            description = "Keeps the local LLM engine resident and responsive."
+            setShowBadge(false)
         }
+        val nm: NotificationManager = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(channel)
     }
 
     private fun buildNotification(text: String): Notification {
@@ -218,29 +199,34 @@ class InferenceService : Service() {
     }
 
     private fun updateNotification(text: String) {
-        val nm = getSystemService(NotificationManager::class.java)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            return // notification updates are suppressed without the runtime grant
+        }
+        val nm: NotificationManager = getSystemService(NotificationManager::class.java)
         nm.notify(NOTIFICATION_ID, buildNotification(text))
     }
 
     private fun startForegroundCompat(notification: Notification) {
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-        } else {
-            0
-        }
-        ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, type)
+        ServiceCompat.startForeground(
+            this,
+            NOTIFICATION_ID,
+            notification,
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE, // minSdk 34 => always available
+        )
     }
 
     companion object {
         const val CHANNEL_ID = "ratherllm_inference"
-        const val NOTIFICATION_ID = 0xR1L // any stable non-zero id
-                const val WAKELOCK_TAG = "ratherllm:decode"
+        const val NOTIFICATION_ID = 0x524C // stable non-zero id ("RL")
+        const val WAKELOCK_TAG = "ratherllm:decode"
+        private const val WAKELOCK_TIMEOUT_MS = 10L * 60L * 1000L // 10 min
 
         const val ACTION_STOP = "com.kotlin.ratherllm.action.STOP_ENGINE"
         const val EXTRA_MODEL_PATH = "com.kotlin.ratherllm.extra.MODEL_PATH"
         const val EXTRA_USE_NEUROPILOT = "com.kotlin.ratherllm.extra.USE_NEUROPILOT"
 
-        /** Convenience launcher: starts the service in the foreground with a model. */
         fun start(context: Context, modelPath: String, useNeuropilot: Boolean = true) {
             val intent = Intent(context, InferenceService::class.java).apply {
                 putExtra(EXTRA_MODEL_PATH, modelPath)
