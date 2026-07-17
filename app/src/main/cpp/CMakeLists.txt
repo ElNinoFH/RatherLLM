@@ -35,6 +35,13 @@ set(GGML_VULKAN          OFF CACHE BOOL "" FORCE)  # CPU-only in Stage 2 (Vulkan
 set(GGML_CPU_KLEIDIAI    OFF CACHE BOOL "" FORCE)  # revisit in Stage 6 benchmarks
 set(GGML_LLAMAFILE       ON  CACHE BOOL "" FORCE)
 
+# Stage 6: force the CPU arch to the Dimensity 9500's real feature set. The NDK
+# cross-compile otherwise defaults to armv8-a and the dotprod/i8mm feature probes
+# fail, leaving decode on the slow NEON-only path. dotprod + i8mm are the big
+# quantized-matmul accelerators (int8 matmul); fp16 helps f16 ops. NO sve2/sme
+# (SIGILL risk / no runtime benefit here).
+set(GGML_CPU_ARM_ARCH    "armv8.2-a+dotprod+i8mm+fp16" CACHE STRING "" FORCE)
+
 add_subdirectory(llama.cpp)
 
 find_library(LOG_LIB log REQUIRED)

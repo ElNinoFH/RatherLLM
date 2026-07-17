@@ -64,6 +64,9 @@ class InferenceService : Service() {
     private val _modelName = MutableStateFlow<String?>(null)
     val modelName: StateFlow<String?> = _modelName.asStateFlow()
 
+    private val _lastDecodeTps = MutableStateFlow<Float?>(null)
+    val lastDecodeTps: StateFlow<Float?> = _lastDecodeTps.asStateFlow()
+
     private val _activeModelPath = MutableStateFlow<String?>(null)
     val activeModelPath: StateFlow<String?> = _activeModelPath.asStateFlow()
 
@@ -265,6 +268,9 @@ class InferenceService : Service() {
                     })
                 }
                 lastTimingsJson = runCatching { NativeBridge.lastTimings(h) }.getOrNull()
+                _lastDecodeTps.value = lastTimingsJson?.let {
+                    runCatching { JSONObject(it).optDouble("decodeTokPerSec").toFloat().takeIf { v -> v > 0f } }.getOrNull()
+                }
                 val out = sb.toString()
                 _messages.value = _messages.value + when {
                     out.isNotEmpty()  -> ChatMessage(Role.Assistant, out)

@@ -28,6 +28,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Button
@@ -83,7 +84,7 @@ class MainActivity : ComponentActivity() {
         InferenceService.start(this)
 
         setContent {
-            MaterialTheme {
+            RatherLlmTheme {
                 val service by boundService.collectAsState()
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     val svc = service
@@ -165,12 +166,15 @@ private fun ChatScreen(svc: InferenceService, onOpenModels: () -> Unit) {
     val loadProgress by svc.loadProgress.collectAsState()
     val modelName by svc.modelName.collectAsState()
     val models by svc.models.collectAsState()
+    val decodeTps by svc.lastDecodeTps.collectAsState()
     var input by remember { mutableStateOf("") }
+    var showSettings by remember { mutableStateOf(false) }
 
     ChatContent(
         status = status,
         errorText = svc.lastError,
         modelName = modelName,
+        decodeTps = decodeTps,
         loadProgress = loadProgress,
         hasModels = models.isNotEmpty(),
         messages = messages,
@@ -180,7 +184,17 @@ private fun ChatScreen(svc: InferenceService, onOpenModels: () -> Unit) {
         onSend = { svc.submit(input); input = "" },
         onStop = { svc.cancelGeneration() },
         onOpenModels = onOpenModels,
+        onOpenSettings = { showSettings = true },
     )
+
+    if (showSettings) {
+        SettingsSheet(
+            current = svc.genParams,
+            systemPrompt = svc.systemPrompt,
+            onApply = { p, s -> svc.genParams = p; svc.systemPrompt = s },
+            onDismiss = { showSettings = false },
+        )
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -189,6 +203,7 @@ private fun ChatContent(
     status: InferenceService.Status,
     errorText: String?,
     modelName: String?,
+    decodeTps: Float?,
     loadProgress: Float,
     hasModels: Boolean,
     messages: List<ChatMessage>,
@@ -198,6 +213,7 @@ private fun ChatContent(
     onSend: () -> Unit,
     onStop: () -> Unit,
     onOpenModels: () -> Unit,
+    onOpenSettings: () -> Unit,
 ) {
     val isGenerating = status == InferenceService.Status.Generating
     val listState = rememberLazyListState()
@@ -213,13 +229,16 @@ private fun ChatContent(
                     Column {
                         Text("ratherllm", style = MaterialTheme.typography.titleLarge)
                         Text(
-                            text = statusLine(status, modelName, errorText),
+                            text = statusLine(status, modelName, errorText, decodeTps),
                             style = MaterialTheme.typography.labelSmall,
                             color = statusColor(status),
                         )
                     }
                 },
                 actions = {
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                    }
                     IconButton(onClick = onOpenModels) {
                         Icon(Icons.Filled.Storage, contentDescription = "Models")
                     }
@@ -372,10 +391,11 @@ private fun InputBar(
     }
 }
 
-private fun statusLine(status: InferenceService.Status, modelName: String?, errorText: String?): String = when (status) {
+private fun statusLine(status: InferenceService.Status, modelName: String?, errorText: String?, decodeTps: Float?): String = when (status) {
     InferenceService.Status.Idle -> "idle"
     InferenceService.Status.Loading -> "loading model…"
-    InferenceService.Status.Ready -> "ready · ${modelName ?: "model"}"
+    InferenceService.Status.Ready -> "ready · ${modelName ?: "model"}" +
+        (decodeTps?.let { " · ${String.format(java.util.Locale.US, "%.1f", it)} tok/s" } ?: "")
     InferenceService.Status.Generating -> "generating…"
     InferenceService.Status.Error -> errorText ?: "error"
 }
@@ -397,9 +417,9 @@ private fun sampleMessages(): List<ChatMessage> = listOf(
 private fun ChatReadyPreview() {
     MaterialTheme {
         ChatContent(
-            status = InferenceService.Status.Ready, errorText = null, modelName = "gemma3 4B Q4_0",
+            status = InferenceService.Status.Ready, errorText = null, modelName = "gemma3 4B Q4_0", decodeTps = 8.2f,
             loadProgress = 1f, hasModels = true, messages = sampleMessages(), streamingText = "",
-            input = "", onInputChange = {}, onSend = {}, onStop = {}, onOpenModels = {},
+            input = "", onInputChange = {}, onSend = {}, onStop = {}, onOpenModels = {}, onOpenSettings = {},
         )
     }
 }
@@ -409,9 +429,9 @@ private fun ChatReadyPreview() {
 private fun ChatEmptyPreview() {
     MaterialTheme {
         ChatContent(
-            status = InferenceService.Status.Idle, errorText = null, modelName = null,
+            status = InferenceService.Status.Idle, errorText = null, modelName = null, decodeTps = null,
             loadProgress = 0f, hasModels = false, messages = emptyList(), streamingText = "",
-            input = "", onInputChange = {}, onSend = {}, onStop = {}, onOpenModels = {},
+            input = "", onInputChange = {}, onSend = {}, onStop = {}, onOpenModels = {}, onOpenSettings = {},
         )
     }
 }
