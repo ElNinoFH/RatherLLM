@@ -42,6 +42,7 @@ object NativeBridge {
         nThreadsBatch: Int,
         nGpuLayers: Int,
         useMlock: Boolean,
+        progress: LoadProgressCallback?,
     ): Long
 
     /** Release a handle returned by [loadModel]. Idempotent for handle 0. */
@@ -77,4 +78,11 @@ fun interface TokenCallback {
     /** @return true to keep decoding, false to request a cooperative stop. */
     @Keep
     fun onToken(piece: String): Boolean
+}
+
+/** Model-load progress sink (0f..1f), invoked on the thread that called [NativeBridge.loadModel]. */
+@Keep
+fun interface LoadProgressCallback {
+    @Keep
+    fun onProgress(fraction: Float)
 }

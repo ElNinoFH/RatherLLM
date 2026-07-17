@@ -103,7 +103,8 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* /*vm*/, void* /*reserved*/) {
 JNIEXPORT jlong JNICALL
 Java_com_kotlin_ratherllm_NativeBridge_loadModel(JNIEnv* env, jobject, jstring jpath,
                                                  jint nCtx, jint nThreads, jint nThreadsBatch,
-                                                 jint nGpuLayers, jboolean useMlock) {
+                                                 jint nGpuLayers, jboolean useMlock,
+                                                 jobject progressCb) {
     const std::string path = jstr(env, jpath);
     LoadParams lp;
     lp.n_ctx           = nCtx > 0 ? nCtx : 4096;
@@ -112,8 +113,21 @@ Java_com_kotlin_ratherllm_NativeBridge_loadModel(JNIEnv* env, jobject, jstring j
     lp.n_gpu_layers    = nGpuLayers;
     lp.use_mlock       = (useMlock == JNI_TRUE);
 
+    // Optional load-progress callback (fires on this calling thread during load).
+    std::function<void(float)> on_prog;
+    if (progressCb) {
+        jclass pc = env->GetObjectClass(progressCb);
+        jmethodID pm = env->GetMethodID(pc, "onProgress", "(F)V");
+        if (pm) {
+            on_prog = [env, progressCb, pm](float p) {
+                env->CallVoidMethod(progressCb, pm, static_cast<jfloat>(p));
+                if (env->ExceptionCheck()) env->ExceptionClear();
+            };
+        }
+    }
+
     int rc = RC_OK;
-    LlamaEngine* raw = LlamaEngine::load(path, lp, rc);
+    LlamaEngine* raw = LlamaEngine::load(path, lp, rc, on_prog);
     if (!raw) return static_cast<jlong>(rc);
 
     std::lock_guard<std::mutex> lk(g_mtx);

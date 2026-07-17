@@ -28,9 +28,12 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -38,13 +41,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -52,11 +53,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import androidx.compose.material.icons.filled.Stop
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.launch
 import java.io.File
 
 class MainActivity : ComponentActivity() {
@@ -67,7 +64,6 @@ class MainActivity : ComponentActivity() {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             boundService.value = (binder as? InferenceService.LocalBinder)?.service
         }
-
         override fun onServiceDisconnected(name: ComponentName?) {
             boundService.value = null
         }
@@ -76,19 +72,26 @@ class MainActivity : ComponentActivity() {
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* FGS runs regardless */ }
 
-    // Legacy demo location; Stage 4 introduces the models/ directory + picker.
-    private val modelPath: String by lazy { File(filesDir, "model.gguf").absolutePath }
+    // Legacy demo model; Stage 4 replaces this with a models/ directory + picker.
+    private val defaultModelPath: String by lazy { File(filesDir, "model.gguf").absolutePath }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestNotificationPermissionIfNeeded()
-        InferenceService.start(this, modelPath)
+        InferenceService.start(this) // start FGS; model load stays on-demand
 
         setContent {
             MaterialTheme {
                 val service by boundService.collectAsState()
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    ChatScreen(service = service)
+                    val svc = service
+                    if (svc == null) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text("Connecting to engine…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    } else {
+                        ChatScreen(svc, defaultModelPath)
+                    }
                 }
             }
         }
@@ -113,75 +116,27 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun ChatScreen(service: InferenceService?) {
-    val scope: CoroutineScope = rememberCoroutineScope()
-
-    val messages = remember { mutableStateListOf<ChatMessage>() }
-    var streamingText by remember { mutableStateOf("") }
-    var isStreaming by remember { mutableStateOf(false) }
+private fun ChatScreen(svc: InferenceService, defaultModelPath: String) {
+    val status by svc.status.collectAsState()
+    val messages by svc.messages.collectAsState()
+    val streamingText by svc.streamingText.collectAsState()
+    val loadProgress by svc.loadProgress.collectAsState()
+    val modelName by svc.modelName.collectAsState()
     var input by remember { mutableStateOf("") }
-    var streamJob by remember { mutableStateOf<Job?>(null) }
-
-    var status by remember { mutableStateOf(InferenceService.Status.Idle) }
-    LaunchedEffect(service) {
-        status = service?.status?.value ?: InferenceService.Status.Idle
-        service?.status?.collect { status = it }
-    }
-
-    fun send() {
-        val prompt = input.trim()
-        val svc = service
-        if (prompt.isEmpty() || isStreaming || svc == null || !svc.isReady) return
-
-        input = ""
-        messages.add(ChatMessage(Role.User, prompt))
-        streamingText = ""
-        isStreaming = true
-
-        val history = messages.toList()
-        streamJob = scope.launch {
-            val sb = StringBuilder()
-            try {
-                svc.streamTokens(history).collect { chunk ->
-                    if (chunk.text.isNotEmpty()) {
-                        sb.append(chunk.text)
-                        streamingText = sb.toString()
-                    }
-                    if (chunk.final) {
-                        messages.add(ChatMessage(Role.Assistant, sb.toString()))
-                        streamingText = ""
-                        isStreaming = false
-                    }
-                }
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e // clean cancel: partial text committed in finally, no error bubble
-            } catch (e: Exception) {
-                messages.add(ChatMessage(Role.Assistant, "⚠️ ${e.message}"))
-            } finally {
-                if (isStreaming) {
-                    if (sb.isNotEmpty()) messages.add(ChatMessage(Role.Assistant, sb.toString()))
-                    streamingText = ""
-                    isStreaming = false
-                }
-            }
-        }
-    }
-
-    fun stop() {
-        streamJob?.cancel()
-    }
 
     ChatContent(
         status = status,
-        errorText = service?.lastError,
-        bound = service != null,
+        errorText = svc.lastError,
+        modelName = modelName,
+        loadProgress = loadProgress,
+        modelAvailable = File(defaultModelPath).exists(),
         messages = messages,
         streamingText = streamingText,
-        isStreaming = isStreaming,
         input = input,
         onInputChange = { input = it },
-        onSend = ::send,
-        onStop = ::stop,
+        onSend = { svc.submit(input); input = "" },
+        onStop = { svc.cancelGeneration() },
+        onLoadModel = { svc.loadModel(defaultModelPath) },
     )
 }
 
@@ -190,18 +145,21 @@ private fun ChatScreen(service: InferenceService?) {
 private fun ChatContent(
     status: InferenceService.Status,
     errorText: String?,
-    bound: Boolean,
+    modelName: String?,
+    loadProgress: Float,
+    modelAvailable: Boolean,
     messages: List<ChatMessage>,
     streamingText: String,
-    isStreaming: Boolean,
     input: String,
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
     onStop: () -> Unit,
+    onLoadModel: () -> Unit,
 ) {
+    val isGenerating = status == InferenceService.Status.Generating
     val listState = rememberLazyListState()
-    LaunchedEffect(messages.size, streamingText, isStreaming) {
-        val count = messages.size + if (isStreaming) 1 else 0
+    LaunchedEffect(messages.size, streamingText, isGenerating) {
+        val count = messages.size + if (isGenerating && streamingText.isNotEmpty()) 1 else 0
         if (count > 0) listState.animateScrollToItem(count - 1)
     }
 
@@ -211,8 +169,7 @@ private fun ChatContent(
                 Column {
                     Text("ratherllm", style = MaterialTheme.typography.titleLarge)
                     Text(
-                        text = if (status == InferenceService.Status.Error && !errorText.isNullOrBlank())
-                            errorText else statusLabel(status, bound),
+                        text = statusLine(status, modelName, errorText),
                         style = MaterialTheme.typography.labelSmall,
                         color = statusColor(status),
                     )
@@ -220,37 +177,97 @@ private fun ChatContent(
             })
         },
         bottomBar = {
-            InputBar(
-                value = input,
-                onValueChange = onInputChange,
-                enabled = status == InferenceService.Status.Ready && !isStreaming,
-                isStreaming = isStreaming,
-                onSend = onSend,
-                onStop = onStop,
-            )
-        },
-    ) { padding ->
-        if (messages.isEmpty() && !isStreaming) {
-            Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
-                Text(
-                    text = emptyStateText(status, errorText),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(32.dp),
+            if (status == InferenceService.Status.Ready || isGenerating) {
+                InputBar(
+                    value = input,
+                    onValueChange = onInputChange,
+                    enabled = status == InferenceService.Status.Ready,
+                    isGenerating = isGenerating,
+                    onSend = onSend,
+                    onStop = onStop,
                 )
             }
-        } else {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                contentPadding = PaddingValues(vertical = 12.dp),
-            ) {
-                itemsIndexed(messages) { _, msg -> MessageBubble(msg.role, msg.text) }
-                if (isStreaming) {
-                    item { MessageBubble(Role.Assistant, streamingText, showCaret = true) }
-                }
+        },
+    ) { padding ->
+        Box(Modifier.fillMaxSize().padding(padding)) {
+            when {
+                status == InferenceService.Status.Loading ->
+                    LoadingState(loadProgress)
+                messages.isEmpty() && !isGenerating ->
+                    EmptyState(status, errorText, modelAvailable, onLoadModel)
+                else ->
+                    MessageList(listState, messages, streamingText, isGenerating)
             }
+        }
+    }
+}
+
+@Composable
+private fun LoadingState(progress: Float) {
+    Column(
+        Modifier.fillMaxSize().padding(32.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text("Loading model…", style = MaterialTheme.typography.titleMedium)
+        Text("${(progress * 100).toInt()}%", style = MaterialTheme.typography.bodyMedium)
+        LinearProgressIndicator(
+            progress = { progress.coerceIn(0f, 1f) },
+            modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+        )
+    }
+}
+
+@Composable
+private fun EmptyState(
+    status: InferenceService.Status,
+    errorText: String?,
+    modelAvailable: Boolean,
+    onLoadModel: () -> Unit,
+) {
+    Column(
+        Modifier.fillMaxSize().padding(32.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        val headline = when (status) {
+            InferenceService.Status.Error -> errorText ?: "Something went wrong"
+            InferenceService.Status.Ready -> "Ready. Say something to begin."
+            else -> "No model loaded yet"
+        }
+        Text(headline, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (status != InferenceService.Status.Ready) {
+            Button(onClick = onLoadModel, enabled = modelAvailable, modifier = Modifier.padding(top = 16.dp)) {
+                Text(if (status == InferenceService.Status.Error) "Reload model" else "Load Gemma 3 4B")
+            }
+            if (!modelAvailable) {
+                Text(
+                    "Model file not found in app storage.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MessageList(
+    listState: androidx.compose.foundation.lazy.LazyListState,
+    messages: List<ChatMessage>,
+    streamingText: String,
+    isGenerating: Boolean,
+) {
+    LazyColumn(
+        state = listState,
+        modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(vertical = 12.dp),
+    ) {
+        itemsIndexed(messages) { _, msg -> MessageBubble(msg.role, msg.text) }
+        if (isGenerating) {
+            item { MessageBubble(Role.Assistant, streamingText, showCaret = true) }
         }
     }
 }
@@ -262,7 +279,6 @@ private fun MessageBubble(role: Role, text: String, showCaret: Boolean = false) 
         if (isUser) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
     val textColor =
         if (isUser) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
-
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
@@ -285,7 +301,7 @@ private fun InputBar(
     value: String,
     onValueChange: (String) -> Unit,
     enabled: Boolean,
-    isStreaming: Boolean,
+    isGenerating: Boolean,
     onSend: () -> Unit,
     onStop: () -> Unit,
 ) {
@@ -299,16 +315,14 @@ private fun InputBar(
                 value = value,
                 onValueChange = onValueChange,
                 modifier = Modifier.weight(1f),
-                placeholder = { Text(if (enabled) "Ask anything…" else "Engine not ready") },
+                placeholder = { Text(if (enabled) "Ask anything…" else "Generating…") },
                 enabled = enabled,
                 maxLines = 4,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                 keyboardActions = KeyboardActions(onSend = { onSend() }),
             )
-            if (isStreaming) {
-                IconButton(onClick = onStop) {
-                    Icon(Icons.Filled.Stop, contentDescription = "Stop")
-                }
+            if (isGenerating) {
+                IconButton(onClick = onStop) { Icon(Icons.Filled.Stop, contentDescription = "Stop") }
             } else {
                 IconButton(onClick = onSend, enabled = enabled && value.isNotBlank()) {
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
@@ -318,20 +332,12 @@ private fun InputBar(
     }
 }
 
-private fun statusLabel(status: InferenceService.Status, bound: Boolean): String = when {
-    !bound -> "connecting to service…"
-    status == InferenceService.Status.Idle -> "idle"
-    status == InferenceService.Status.Loading -> "loading model…"
-    status == InferenceService.Status.Ready -> "ready"
-    status == InferenceService.Status.Generating -> "generating…"
-    else -> "error"
-}
-
-private fun emptyStateText(status: InferenceService.Status, errorText: String?): String = when (status) {
-    InferenceService.Status.Error -> errorText ?: "Engine error"
-    InferenceService.Status.Loading -> "Loading model…"
-    InferenceService.Status.Ready -> "Ready. Say something to begin."
-    else -> "Starting engine…"
+private fun statusLine(status: InferenceService.Status, modelName: String?, errorText: String?): String = when (status) {
+    InferenceService.Status.Idle -> "idle"
+    InferenceService.Status.Loading -> "loading model…"
+    InferenceService.Status.Ready -> "ready · ${modelName ?: "model"}"
+    InferenceService.Status.Generating -> "generating…"
+    InferenceService.Status.Error -> errorText ?: "error"
 }
 
 @Composable
@@ -342,44 +348,42 @@ private fun statusColor(status: InferenceService.Status): Color = when (status) 
 }
 
 private fun sampleMessages(): List<ChatMessage> = listOf(
-    ChatMessage(Role.User, "What SoC am I running on?"),
-    ChatMessage(Role.Assistant, "You're on the MediaTek Dimensity 9500 (MT6991): 1× Cortex-X925 prime + 3× X4 + 4× A720, ARMv9.2-A."),
+    ChatMessage(Role.User, "Sebutkan 3 warna bendera Indonesia"),
+    ChatMessage(Role.Assistant, "Merah, Putih, dan kombinasi Merah-Putih."),
 )
 
-@androidx.compose.ui.tooling.preview.Preview(showBackground = true, name = "Chat · Ready")
+@androidx.compose.ui.tooling.preview.Preview(showBackground = true, name = "Ready")
 @Composable
-private fun ChatContentReadyPreview() {
+private fun ChatReadyPreview() {
     MaterialTheme {
         ChatContent(
-            status = InferenceService.Status.Ready,
-            errorText = null,
-            bound = true,
-            messages = sampleMessages(),
-            streamingText = "",
-            isStreaming = false,
-            input = "",
-            onInputChange = {},
-            onSend = {},
-            onStop = {},
+            status = InferenceService.Status.Ready, errorText = null, modelName = "gemma3 4B Q4_0",
+            loadProgress = 1f, modelAvailable = true, messages = sampleMessages(), streamingText = "",
+            input = "", onInputChange = {}, onSend = {}, onStop = {}, onLoadModel = {},
         )
     }
 }
 
-@androidx.compose.ui.tooling.preview.Preview(showBackground = true, name = "Chat · Error")
+@androidx.compose.ui.tooling.preview.Preview(showBackground = true, name = "Empty · load")
 @Composable
-private fun ChatContentErrorPreview() {
+private fun ChatEmptyPreview() {
     MaterialTheme {
         ChatContent(
-            status = InferenceService.Status.Error,
-            errorText = "Engine not implemented yet (Stage 1 skeleton)",
-            bound = true,
-            messages = emptyList(),
-            streamingText = "",
-            isStreaming = false,
-            input = "",
-            onInputChange = {},
-            onSend = {},
-            onStop = {},
+            status = InferenceService.Status.Idle, errorText = null, modelName = null,
+            loadProgress = 0f, modelAvailable = true, messages = emptyList(), streamingText = "",
+            input = "", onInputChange = {}, onSend = {}, onStop = {}, onLoadModel = {},
+        )
+    }
+}
+
+@androidx.compose.ui.tooling.preview.Preview(showBackground = true, name = "Loading")
+@Composable
+private fun ChatLoadingPreview() {
+    MaterialTheme {
+        ChatContent(
+            status = InferenceService.Status.Loading, errorText = null, modelName = null,
+            loadProgress = 0.42f, modelAvailable = true, messages = emptyList(), streamingText = "",
+            input = "", onInputChange = {}, onSend = {}, onStop = {}, onLoadModel = {},
         )
     }
 }

@@ -64,11 +64,27 @@ static void fill_info(const llama_model* model, ModelInfo& out) {
     out.ok = true;
 }
 
-LlamaEngine* LlamaEngine::load(const std::string& path, const LoadParams& p, int& rc) {
+namespace {
+struct ProgressCtx { const std::function<void(float)>* cb; };
+bool progress_trampoline(float progress, void* ud) {
+    auto* c = static_cast<ProgressCtx*>(ud);
+    if (c && c->cb && *c->cb) (*c->cb)(progress);
+    return true; // keep loading
+}
+} // namespace
+
+LlamaEngine* LlamaEngine::load(const std::string& path, const LoadParams& p, int& rc,
+                               const std::function<void(float)>& on_progress) {
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = p.n_gpu_layers;
     mp.use_mmap     = true;
     mp.use_mlock    = p.use_mlock;
+
+    ProgressCtx pctx{ &on_progress };
+    if (on_progress) {
+        mp.progress_callback = progress_trampoline;
+        mp.progress_callback_user_data = &pctx;
+    }
 
     llama_model* model = llama_model_load_from_file(path.c_str(), mp);
     if (!model) {
@@ -97,6 +113,7 @@ LlamaEngine* LlamaEngine::load(const std::string& path, const LoadParams& p, int
     e->ctx_   = ctx;
     e->vocab_ = llama_model_get_vocab(model);
     e->n_ctx_ = static_cast<int>(llama_n_ctx(ctx));
+    e->n_ctx_train_ = llama_model_n_ctx_train(model);
     rc = RC_OK;
 
     ModelInfo mi = e->info();
@@ -133,9 +150,11 @@ static llama_sampler* build_sampler(const GenParams& gp) {
     sp.no_perf = true;
     llama_sampler* s = llama_sampler_chain_init(sp);
 
-    if (gp.repeat_penalty != 1.0f) {
-        llama_sampler_chain_add(s, llama_sampler_init_penalties(256, gp.repeat_penalty, 0.0f, 0.0f));
-    }
+    // Repetition penalty + a frequency term (logit reduced in proportion to how
+    // often a token already appeared). The frequency term breaks the degenerate
+    // loops Q4_0 falls into, without the ~30x per-token cost the DRY sampler
+    // incurs with Gemma 3's 131072 training context.
+    llama_sampler_chain_add(s, llama_sampler_init_penalties(256, gp.repeat_penalty, 0.4f, 0.0f));
     if (gp.temperature <= 0.0f) {
         llama_sampler_chain_add(s, llama_sampler_init_greedy());
     } else {
@@ -211,6 +230,7 @@ int LlamaEngine::generate(const std::vector<GenMessage>& msgs, const GenParams& 
                                          : (n_ctx_ - static_cast<int>(tokens.size()));
     std::string pending;
     int rc = RC_OK;
+    double cb_ms = 0.0;
     const auto t_dec0 = now();
 
     for (int i = 0; i < budget; ++i) {
@@ -225,7 +245,9 @@ int LlamaEngine::generate(const std::vector<GenMessage>& msgs, const GenParams& 
         const size_t emit_len = utf8_complete_len(pending);
         bool keep_going = true;
         if (emit_len > 0) {
+            const auto tcb = now();
             keep_going = cb(pending.substr(0, emit_len));
+            cb_ms += ms_since(tcb);
             pending.erase(0, emit_len);
         }
         if (!keep_going) { last_stats_.cancelled = true; break; }
@@ -241,12 +263,13 @@ int LlamaEngine::generate(const std::vector<GenMessage>& msgs, const GenParams& 
     last_stats_.decode_ms = ms_since(t_dec0);
     llama_sampler_free(smpl);
 
-    LOGI("gen done: prompt=%d prefill=%.1fms (%.1f tok/s) decode=%d %.1fms (%.1f tok/s) eog=%d cancel=%d",
+    const double pure_ms = last_stats_.decode_ms - cb_ms;
+    LOGI("gen done: prompt=%d prefill=%.1fms (%.1f tok/s) decode=%d %.1fms (pure %.1fms=%.1f tok/s, cb %.1fms) eog=%d cancel=%d",
          last_stats_.n_prompt, last_stats_.prefill_ms,
          last_stats_.prefill_ms > 0 ? last_stats_.n_prompt * 1000.0 / last_stats_.prefill_ms : 0.0,
          last_stats_.n_decoded, last_stats_.decode_ms,
-         last_stats_.decode_ms > 0 ? last_stats_.n_decoded * 1000.0 / last_stats_.decode_ms : 0.0,
-         (int) last_stats_.stopped_eog, (int) last_stats_.cancelled);
+         pure_ms, pure_ms > 0 ? last_stats_.n_decoded * 1000.0 / pure_ms : 0.0,
+         cb_ms, (int) last_stats_.stopped_eog, (int) last_stats_.cancelled);
     return rc;
 }
 

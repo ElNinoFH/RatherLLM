@@ -89,7 +89,9 @@ using PieceCallback = std::function<bool(const std::string&)>;
 class LlamaEngine {
 public:
     // Loads a model. On failure returns nullptr and sets rc. On success rc == RC_OK.
-    static LlamaEngine* load(const std::string& path, const LoadParams& p, int& rc);
+    // on_progress (optional) is invoked with a 0..1 fraction during weight load.
+    static LlamaEngine* load(const std::string& path, const LoadParams& p, int& rc,
+                             const std::function<void(float)>& on_progress = {});
     ~LlamaEngine();
 
     // Runs one generation (stateless: the full conversation is re-templated and
@@ -115,6 +117,7 @@ private:
     llama_context*      ctx_   = nullptr;
     const llama_vocab*  vocab_ = nullptr;
     int                 n_ctx_ = 0;
+    int                 n_ctx_train_ = 0;
 
     std::atomic<bool>   cancel_{false};
     std::mutex          gen_mtx_;
