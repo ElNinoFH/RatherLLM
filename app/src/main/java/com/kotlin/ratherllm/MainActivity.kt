@@ -26,29 +26,42 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Button
+import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.NavigationDrawerItem
+import androidx.compose.material3.NavigationDrawerItemDefaults
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -167,33 +180,83 @@ private fun ChatScreen(svc: InferenceService, onOpenModels: () -> Unit) {
     val modelName by svc.modelName.collectAsState()
     val models by svc.models.collectAsState()
     val decodeTps by svc.lastDecodeTps.collectAsState()
+    val conversations by svc.conversations.collectAsState()
+    val currentConvId by svc.currentConversationId.collectAsState()
     var input by remember { mutableStateOf("") }
     var showSettings by remember { mutableStateOf(false) }
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
 
-    ChatContent(
-        status = status,
-        errorText = svc.lastError,
-        modelName = modelName,
-        decodeTps = decodeTps,
-        loadProgress = loadProgress,
-        hasModels = models.isNotEmpty(),
-        messages = messages,
-        streamingText = streamingText,
-        input = input,
-        onInputChange = { input = it },
-        onSend = { svc.submit(input); input = "" },
-        onStop = { svc.cancelGeneration() },
-        onOpenModels = onOpenModels,
-        onOpenSettings = { showSettings = true },
-    )
-
-    if (showSettings) {
-        SettingsSheet(
-            current = svc.genParams,
-            systemPrompt = svc.systemPrompt,
-            onApply = { p, s -> svc.genParams = p; svc.systemPrompt = s },
-            onDismiss = { showSettings = false },
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            ConversationsDrawer(
+                conversations = conversations,
+                currentId = currentConvId,
+                onNew = { svc.newConversation(); scope.launch { drawerState.close() } },
+                onSelect = { id -> svc.switchConversation(id); scope.launch { drawerState.close() } },
+                onDelete = { id -> svc.deleteConversation(id) },
+            )
+        },
+    ) {
+        ChatContent(
+            status = status,
+            errorText = svc.lastError,
+            modelName = modelName,
+            decodeTps = decodeTps,
+            loadProgress = loadProgress,
+            hasModels = models.isNotEmpty(),
+            messages = messages,
+            streamingText = streamingText,
+            input = input,
+            onInputChange = { input = it },
+            onSend = { svc.submit(input); input = "" },
+            onStop = { svc.cancelGeneration() },
+            onOpenModels = onOpenModels,
+            onOpenSettings = { showSettings = true },
+            onOpenDrawer = { scope.launch { drawerState.open() } },
+            onNewChat = { svc.newConversation() },
         )
+        if (showSettings) {
+            SettingsSheet(
+                current = svc.genParams,
+                systemPrompt = svc.systemPrompt,
+                onApply = { p, s -> svc.genParams = p; svc.systemPrompt = s },
+                onDismiss = { showSettings = false },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ConversationsDrawer(
+    conversations: List<Conversation>,
+    currentId: String,
+    onNew: () -> Unit,
+    onSelect: (String) -> Unit,
+    onDelete: (String) -> Unit,
+) {
+    ModalDrawerSheet {
+        Text("Conversations", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(16.dp))
+        TextButton(onClick = onNew, modifier = Modifier.padding(horizontal = 12.dp)) {
+            Icon(Icons.Filled.Add, contentDescription = null)
+            Text("  New chat")
+        }
+        LazyColumn(Modifier.fillMaxSize()) {
+            items(conversations, key = { it.id }) { c ->
+                NavigationDrawerItem(
+                    label = { Text(c.title, maxLines = 1) },
+                    selected = c.id == currentId,
+                    onClick = { onSelect(c.id) },
+                    badge = {
+                        IconButton(onClick = { onDelete(c.id) }) {
+                            Icon(Icons.Filled.DeleteOutline, contentDescription = "Delete", tint = MaterialTheme.colorScheme.error)
+                        }
+                    },
+                    modifier = Modifier.padding(NavigationDrawerItemDefaults.ItemPadding),
+                )
+            }
+        }
     }
 }
 
@@ -214,6 +277,8 @@ private fun ChatContent(
     onStop: () -> Unit,
     onOpenModels: () -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenDrawer: () -> Unit,
+    onNewChat: () -> Unit,
 ) {
     val isGenerating = status == InferenceService.Status.Generating
     val listState = rememberLazyListState()
@@ -225,6 +290,11 @@ private fun ChatContent(
     Scaffold(
         topBar = {
             TopAppBar(
+                navigationIcon = {
+                    IconButton(onClick = onOpenDrawer) {
+                        Icon(Icons.Filled.Menu, contentDescription = "Conversations")
+                    }
+                },
                 title = {
                     Column {
                         Text("ratherllm", style = MaterialTheme.typography.titleLarge)
@@ -236,6 +306,9 @@ private fun ChatContent(
                     }
                 },
                 actions = {
+                    IconButton(onClick = onNewChat) {
+                        Icon(Icons.Filled.Add, contentDescription = "New chat")
+                    }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Filled.Settings, contentDescription = "Settings")
                     }
@@ -342,13 +415,18 @@ private fun MessageBubble(role: Role, text: String, showCaret: Boolean = false) 
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
     ) {
-        Surface(color = bubbleColor, shape = RoundedCornerShape(16.dp), modifier = Modifier.widthIn(max = 320.dp)) {
+        Surface(color = bubbleColor, shape = RoundedCornerShape(16.dp), modifier = Modifier.widthIn(max = 340.dp)) {
             Box(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-                Text(
-                    text = if (showCaret && text.isEmpty()) "▌" else if (showCaret) "$text▌" else text,
-                    color = textColor,
-                    style = MaterialTheme.typography.bodyLarge,
-                )
+                if (!isUser && !showCaret) {
+                    // Final assistant messages render Markdown (code blocks + copy, bold, lists).
+                    MarkdownText(text, textColor)
+                } else {
+                    Text(
+                        text = if (showCaret && text.isEmpty()) "▌" else if (showCaret) "$text▌" else text,
+                        color = textColor,
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                }
             }
         }
     }
@@ -420,6 +498,7 @@ private fun ChatReadyPreview() {
             status = InferenceService.Status.Ready, errorText = null, modelName = "gemma3 4B Q4_0", decodeTps = 8.2f,
             loadProgress = 1f, hasModels = true, messages = sampleMessages(), streamingText = "",
             input = "", onInputChange = {}, onSend = {}, onStop = {}, onOpenModels = {}, onOpenSettings = {},
+            onOpenDrawer = {}, onNewChat = {},
         )
     }
 }
@@ -432,6 +511,7 @@ private fun ChatEmptyPreview() {
             status = InferenceService.Status.Idle, errorText = null, modelName = null, decodeTps = null,
             loadProgress = 0f, hasModels = false, messages = emptyList(), streamingText = "",
             input = "", onInputChange = {}, onSend = {}, onStop = {}, onOpenModels = {}, onOpenSettings = {},
+            onOpenDrawer = {}, onNewChat = {},
         )
     }
 }

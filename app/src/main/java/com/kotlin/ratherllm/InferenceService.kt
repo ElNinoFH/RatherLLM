@@ -84,6 +84,17 @@ class InferenceService : Service() {
     private val _opBusy = MutableStateFlow(false)           // an import/download is running
     val opBusy: StateFlow<Boolean> = _opBusy.asStateFlow()
 
+    // ---- Conversation history -----------------------------------------------
+    private val store: ConversationStore by lazy { ConversationStore(this) }
+    private val _conversations = MutableStateFlow<List<Conversation>>(emptyList())
+    val conversations: StateFlow<List<Conversation>> = _conversations.asStateFlow()
+
+    private val _currentId = MutableStateFlow("")
+    val currentConversationId: StateFlow<String> = _currentId.asStateFlow()
+    private var currentId: String
+        get() = _currentId.value
+        set(v) { _currentId.value = v }
+
     @Volatile var lastError: String? = null; private set
     @Volatile var modelPath: String? = null; private set
     @Volatile var lastTimingsJson: String? = null; private set
@@ -107,6 +118,16 @@ class InferenceService : Service() {
         serviceScope.launch {
             runCatching { repo.migrateLegacyModel() }
             _models.value = runCatching { repo.listModels() }.getOrDefault(emptyList())
+            val convos = runCatching { store.load() }.getOrDefault(emptyList())
+            if (convos.isNotEmpty()) {
+                _conversations.value = convos
+                currentId = convos.first().id
+                _messages.value = convos.first().messages
+            } else {
+                val c = Conversation()
+                currentId = c.id
+                _conversations.value = listOf(c)
+            }
         }
     }
 
@@ -250,6 +271,7 @@ class InferenceService : Service() {
 
         val convo = _messages.value + ChatMessage(Role.User, text)
         _messages.value = convo
+        persistCurrent()
         _status.value = Status.Generating
         acquireWakeLock()
         updateNotification()
@@ -284,6 +306,7 @@ class InferenceService : Service() {
                 _messages.value = _messages.value + ChatMessage(Role.Assistant, "⚠️ ${e.message}")
             } finally {
                 _streamingText.value = ""
+                persistCurrent()
                 _status.value = if (handle > 0L) Status.Ready else Status.Idle
                 releaseWakeLock()
                 updateNotification()
@@ -297,10 +320,49 @@ class InferenceService : Service() {
         genJob?.cancel()
     }
 
-    fun clearConversation() {
+    fun newConversation() {
         if (_status.value == Status.Generating) cancelGeneration()
+        val c = Conversation()
+        currentId = c.id
         _messages.value = emptyList()
         _streamingText.value = ""
+        _conversations.value = listOf(c) + _conversations.value
+        serviceScope.launch { store.save(_conversations.value) }
+    }
+
+    fun switchConversation(id: String) {
+        if (id == currentId) return
+        if (_status.value == Status.Generating) cancelGeneration()
+        val c = _conversations.value.find { it.id == id } ?: return
+        currentId = id
+        _messages.value = c.messages
+        _streamingText.value = ""
+    }
+
+    fun deleteConversation(id: String) {
+        serviceScope.launch {
+            val remaining = _conversations.value.filter { it.id != id }
+            _conversations.value = remaining
+            store.save(remaining)
+            if (id == currentId) {
+                val next = remaining.firstOrNull()
+                if (next != null) { currentId = next.id; _messages.value = next.messages }
+                else { newConversation() }
+            }
+        }
+    }
+
+    /** Snapshot the current messages into the current conversation and persist. */
+    private fun persistCurrent() {
+        val id = currentId.ifBlank { return }
+        val msgs = _messages.value
+        val existing = _conversations.value.find { it.id == id }
+        val title = existing?.title?.takeUnless { it == "New chat" }
+            ?: msgs.firstOrNull { it.role == Role.User }?.let { ConversationStore.titleFrom(it.text) }
+            ?: "New chat"
+        val updated = Conversation(id, title, msgs, System.currentTimeMillis())
+        _conversations.value = listOf(updated) + _conversations.value.filter { it.id != id }
+        serviceScope.launch { store.save(_conversations.value) }
     }
 
     private fun buildRequestJson(convo: List<ChatMessage>): String {

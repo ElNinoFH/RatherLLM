@@ -10,6 +10,7 @@
 #include <android/log.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 
 #define TAG "ratherllm.eng"
@@ -56,7 +57,13 @@ static void fill_info(const llama_model* model, ModelInfo& out) {
     out.arch = meta("general.architecture");
     out.name = meta("general.name");
     if (llama_model_desc(model, buf, sizeof(buf)) > 0) out.desc = buf;
-    if (const char* q = llama_ftype_name(llama_model_ftype(model))) out.quant = q;
+    // Prefer the GGUF general.file_type metadata: llama_model_ftype() is unset
+    // (reads F32) under a vocab_only load, which is how read_info() opens files.
+    {
+        const std::string ft = meta("general.file_type");
+        const int ftype = ft.empty() ? static_cast<int>(llama_model_ftype(model)) : std::atoi(ft.c_str());
+        if (const char* q = llama_ftype_name(static_cast<enum llama_ftype>(ftype))) out.quant = q;
+    }
     out.n_params    = llama_model_n_params(model);
     out.size_bytes  = llama_model_size(model);
     out.n_ctx_train = llama_model_n_ctx_train(model);
