@@ -6,13 +6,18 @@ enum class Role(val wire: String) { System("system"), User("user"), Assistant("a
 /** A single chat turn. */
 data class ChatMessage(val role: Role, val text: String)
 
-/** Sampling / generation parameters passed to the native engine. */
+/**
+ * Sampling / generation parameters passed to the native engine. Defaults follow
+ * Google's Gemma 3 recommendation (temp 1.0, top-k 64, top-p 0.95, min-p 0) plus
+ * a mild repetition penalty; higher temperature also strongly reduces the
+ * degenerate loops seen with low-temperature greedy-ish decoding.
+ */
 data class GenParams(
     val maxTokens: Int = 512,
-    val temperature: Float = 0.8f,
-    val topK: Int = 40,
+    val temperature: Float = 1.0f,
+    val topK: Int = 64,
     val topP: Float = 0.95f,
-    val minP: Float = 0.05f,
+    val minP: Float = 0.05f,   // filters the low-prob garbage tail of lossy quants (e.g. Q4_0)
     val repeatPenalty: Float = 1.1f,
     val seed: Int = -1,
 )

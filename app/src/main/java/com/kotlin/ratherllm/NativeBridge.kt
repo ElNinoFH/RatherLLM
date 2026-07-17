@@ -61,6 +61,9 @@ object NativeBridge {
     /** Cooperatively cancel an in-flight [generate] on [handle]. Thread-safe. */
     external fun cancel(handle: Long)
 
+    /** JSON timings for the most recent [generate] on [handle] (tok/s, counts), or null. */
+    external fun lastTimings(handle: Long): String?
+
     /** llama.cpp/ggml build + detected CPU features, for diagnostics. */
     external fun systemInfo(): String
 }

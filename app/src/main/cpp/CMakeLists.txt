@@ -4,24 +4,58 @@ project(RatherLLM C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# AGP compiles the debug variant's native code at -O0, which makes ggml ~10-50x
+# slower (a 4B model would look hung). Force optimization for the Debug config so
+# the installable debug APK still runs inference at usable speed. Release symbols
+# are stripped into the APK by AGP regardless.
+set(CMAKE_C_FLAGS_DEBUG   "-O3 -g -DNDEBUG")
+set(CMAKE_CXX_FLAGS_DEBUG "-O3 -g -DNDEBUG")
+
 # -----------------------------------------------------------------------------
-#  Compiler flags
+#  Compiler policy
 #
-#  Deliberately NO -march=armv9.2-a+sve2+sme (Dimensity 9500 ships no SME -> a
-#  scalar/SVE2 codepath compiled unconditionally risks SIGILL) and NO -ffast-math
-#  (the softmax uses -INFINITY, which -ffast-math turns into UB). CPU feature
-#  dispatch (i8mm / dotprod / NEON) is delegated to llama.cpp's own build system
-#  in Stage 2, which performs correct *runtime* detection.
+#  No -march=...+sme (Dimensity 9500 has no SME -> SIGILL risk) and no
+#  -ffast-math (breaks the -INFINITY used in softmax). ARM CPU feature dispatch
+#  (NEON / dotprod / i8mm, plus Q4_0 online repack) is handled by ggml's own
+#  build below, which does correct target-appropriate codegen.
 # -----------------------------------------------------------------------------
+
+# ---- llama.cpp build configuration (MUST precede add_subdirectory) ----------
+set(BUILD_SHARED_LIBS    OFF CACHE BOOL "" FORCE)  # static ggml/llama/common -> one .so
+set(GGML_BACKEND_DL      OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_COMMON   ON  CACHE BOOL "" FORCE)  # chat templates (minja), tokenize helpers
+set(LLAMA_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
+set(LLAMA_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
+set(LLAMA_CURL           OFF CACHE BOOL "" FORCE)  # downloads are done in Kotlin
+set(GGML_OPENMP          OFF CACHE BOOL "" FORCE)  # use ggml's own threadpool on Android
+set(GGML_CPU_REPACK      ON  CACHE BOOL "" FORCE)  # runtime Q4_0 -> aarch64 repack (i8mm)
+set(GGML_VULKAN          OFF CACHE BOOL "" FORCE)  # CPU-only in Stage 2 (Vulkan is a Stage 6 experiment; needs SPIRV-Headers)
+set(GGML_CPU_KLEIDIAI    OFF CACHE BOOL "" FORCE)  # revisit in Stage 6 benchmarks
+set(GGML_LLAMAFILE       ON  CACHE BOOL "" FORCE)
+
+add_subdirectory(llama.cpp)
 
 find_library(LOG_LIB log REQUIRED)
+find_library(ANDROID_LIB android REQUIRED)
 
-# Stage 1 skeleton: only the JNI stub is compiled. llama.cpp is wired in at
-# Stage 2 (git submodule at app/src/main/cpp/llama.cpp, add_subdirectory).
 add_library(ratherllm SHARED
         src/jni_bridge.cpp
+        src/llama_engine.cpp
+)
+
+target_include_directories(ratherllm PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/common
+        ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/ggml/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/vendor
 )
 
 target_link_libraries(ratherllm
+        llama-common   # common utils lib (chat templates via minja, tokenize helpers)
+        llama
         ${LOG_LIB}
+        ${ANDROID_LIB}
 )

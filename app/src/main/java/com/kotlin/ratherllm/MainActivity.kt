@@ -52,7 +52,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.compose.material.icons.filled.Stop
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
@@ -118,6 +120,7 @@ private fun ChatScreen(service: InferenceService?) {
     var streamingText by remember { mutableStateOf("") }
     var isStreaming by remember { mutableStateOf(false) }
     var input by remember { mutableStateOf("") }
+    var streamJob by remember { mutableStateOf<Job?>(null) }
 
     var status by remember { mutableStateOf(InferenceService.Status.Idle) }
     LaunchedEffect(service) {
@@ -136,7 +139,7 @@ private fun ChatScreen(service: InferenceService?) {
         isStreaming = true
 
         val history = messages.toList()
-        scope.launch {
+        streamJob = scope.launch {
             val sb = StringBuilder()
             try {
                 svc.streamTokens(history).collect { chunk ->
@@ -150,6 +153,8 @@ private fun ChatScreen(service: InferenceService?) {
                         isStreaming = false
                     }
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e // clean cancel: partial text committed in finally, no error bubble
             } catch (e: Exception) {
                 messages.add(ChatMessage(Role.Assistant, "⚠️ ${e.message}"))
             } finally {
@@ -162,6 +167,10 @@ private fun ChatScreen(service: InferenceService?) {
         }
     }
 
+    fun stop() {
+        streamJob?.cancel()
+    }
+
     ChatContent(
         status = status,
         errorText = service?.lastError,
@@ -172,6 +181,7 @@ private fun ChatScreen(service: InferenceService?) {
         input = input,
         onInputChange = { input = it },
         onSend = ::send,
+        onStop = ::stop,
     )
 }
 
@@ -187,6 +197,7 @@ private fun ChatContent(
     input: String,
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
+    onStop: () -> Unit,
 ) {
     val listState = rememberLazyListState()
     LaunchedEffect(messages.size, streamingText, isStreaming) {
@@ -213,7 +224,9 @@ private fun ChatContent(
                 value = input,
                 onValueChange = onInputChange,
                 enabled = status == InferenceService.Status.Ready && !isStreaming,
+                isStreaming = isStreaming,
                 onSend = onSend,
+                onStop = onStop,
             )
         },
     ) { padding ->
@@ -268,7 +281,14 @@ private fun MessageBubble(role: Role, text: String, showCaret: Boolean = false) 
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun InputBar(value: String, onValueChange: (String) -> Unit, enabled: Boolean, onSend: () -> Unit) {
+private fun InputBar(
+    value: String,
+    onValueChange: (String) -> Unit,
+    enabled: Boolean,
+    isStreaming: Boolean,
+    onSend: () -> Unit,
+    onStop: () -> Unit,
+) {
     Surface(tonalElevation = 3.dp) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
@@ -285,8 +305,14 @@ private fun InputBar(value: String, onValueChange: (String) -> Unit, enabled: Bo
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                 keyboardActions = KeyboardActions(onSend = { onSend() }),
             )
-            IconButton(onClick = onSend, enabled = enabled && value.isNotBlank()) {
-                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
+            if (isStreaming) {
+                IconButton(onClick = onStop) {
+                    Icon(Icons.Filled.Stop, contentDescription = "Stop")
+                }
+            } else {
+                IconButton(onClick = onSend, enabled = enabled && value.isNotBlank()) {
+                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
+                }
             }
         }
     }
@@ -334,6 +360,7 @@ private fun ChatContentReadyPreview() {
             input = "",
             onInputChange = {},
             onSend = {},
+            onStop = {},
         )
     }
 }
@@ -352,6 +379,7 @@ private fun ChatContentErrorPreview() {
             input = "",
             onInputChange = {},
             onSend = {},
+            onStop = {},
         )
     }
 }
