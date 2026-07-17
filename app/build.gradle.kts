@@ -1,4 +1,6 @@
 plugins {
+    // AGP 9.0+ provides built-in Kotlin support, so the standalone
+    // org.jetbrains.kotlin.android plugin must NOT be applied here.
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
@@ -33,9 +35,15 @@ android {
 
     buildTypes {
         release {
-            optimization {
-                enable = false
-            }
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+            // Sign the release APK with the debug key so it installs for smoke
+            // testing (not for distribution).
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {
@@ -49,7 +57,6 @@ android {
         }
     }
     buildFeatures {
-        viewBinding = true
         compose = true
     }
 }

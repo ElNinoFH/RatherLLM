@@ -1,19 +1,22 @@
 package com.kotlin.ratherllm
 
+import androidx.annotation.Keep
+
 /**
- * JNI facade for the native libratherllm.so inference engine.
+ * JNI facade for the native libratherllm.so inference engine (llama.cpp).
  *
- * Lifecycle:
- *   1. [startEngine] — mmap + mlock the GGUF weights, spin up the prime-core
- *      pinned decode thread, and start the abstract-namespace UDS epoll loop.
- *   2. Stream tokens via [RatherLlmClient] (connects over the UDS socket).
- *   3. [stopEngine] — stop/join the decode thread and release the memory arena
- *      BEFORE the UDS server is closed (strict, leak-free teardown order).
+ * Stage 1: these are honest stubs — [loadModel] returns [Rc.NOT_IMPLEMENTED].
+ * Stage 2 fills in the real llama.cpp-backed implementation behind the same
+ * surface, so the Kotlin/service layers do not have to change shape.
  */
 object NativeBridge {
 
     @Volatile
     private var loaded: Boolean = false
+
+    @Volatile
+    var loadError: String? = null
+        private set
 
     init {
         try {
@@ -21,6 +24,7 @@ object NativeBridge {
             loaded = true
         } catch (t: UnsatisfiedLinkError) {
             loaded = false
+            loadError = t.message
         }
     }
 
@@ -28,17 +32,57 @@ object NativeBridge {
     val isLibraryLoaded: Boolean get() = loaded
 
     /**
-     * Initialize and start the native engine + UDS server.
-     *
-     * @param modelPath     absolute path to the GGUF weight file.
-     * @param useNeuropilot request MediaTek APU offload (falls back to CPU if absent).
-     * @return 0 on success, or a negative errno on failure.
+     * Memory-map + prepare a GGUF model for inference.
+     * @return a positive opaque handle on success, or a negative [Rc] code.
      */
-    external fun startEngine(modelPath: String, useNeuropilot: Boolean): Int
+    external fun loadModel(
+        path: String,
+        nCtx: Int,
+        nThreads: Int,
+        nThreadsBatch: Int,
+        nGpuLayers: Int,
+        useMlock: Boolean,
+        progress: LoadProgressCallback?,
+    ): Long
 
-    /** Stop the engine and close the UDS server (idempotent, strict order). */
-    external fun stopEngine()
+    /** Release a handle returned by [loadModel]. Idempotent for handle 0. */
+    external fun freeModel(handle: Long)
 
-    /** @return true while the engine + IO loop are running. */
-    external fun isRunning(): Boolean
+    /** Read GGUF metadata without loading weights. Returns a JSON string or null. */
+    external fun getModelInfo(path: String): String?
+
+    /**
+     * Run a generation. [requestJson] carries the templated conversation and
+     * sampling parameters; [callback] receives token pieces on the calling
+     * thread. Blocks until generation ends, is cancelled, or errors.
+     * @return 0 on success or a negative [Rc] code.
+     */
+    external fun generate(handle: Long, requestJson: String, callback: TokenCallback): Int
+
+    /** Cooperatively cancel an in-flight [generate] on [handle]. Thread-safe. */
+    external fun cancel(handle: Long)
+
+    /** JSON timings for the most recent [generate] on [handle] (tok/s, counts), or null. */
+    external fun lastTimings(handle: Long): String?
+
+    /** llama.cpp/ggml build + detected CPU features, for diagnostics. */
+    external fun systemInfo(): String
+}
+
+/**
+ * Per-token sink invoked by native code on the thread that called [NativeBridge.generate].
+ * Kept (R8) because it is resolved reflectively across the JNI boundary.
+ */
+@Keep
+fun interface TokenCallback {
+    /** @return true to keep decoding, false to request a cooperative stop. */
+    @Keep
+    fun onToken(piece: String): Boolean
+}
+
+/** Model-load progress sink (0f..1f), invoked on the thread that called [NativeBridge.loadModel]. */
+@Keep
+fun interface LoadProgressCallback {
+    @Keep
+    fun onProgress(fraction: Float)
 }
