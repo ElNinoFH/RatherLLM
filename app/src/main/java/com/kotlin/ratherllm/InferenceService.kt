@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.net.Uri
 import android.os.Binder
 import android.os.IBinder
 import android.os.PowerManager
@@ -63,6 +64,23 @@ class InferenceService : Service() {
     private val _modelName = MutableStateFlow<String?>(null)
     val modelName: StateFlow<String?> = _modelName.asStateFlow()
 
+    private val _activeModelPath = MutableStateFlow<String?>(null)
+    val activeModelPath: StateFlow<String?> = _activeModelPath.asStateFlow()
+
+    // ---- Model management (repo/downloader live here so long ops survive UI) --
+    val repo: ModelRepository by lazy { ModelRepository(this) }
+    private val downloader: ModelDownloader by lazy { ModelDownloader(repo) }
+
+    private val _models = MutableStateFlow<List<ModelEntry>>(emptyList())
+    val models: StateFlow<List<ModelEntry>> = _models.asStateFlow()
+
+    private val _opText = MutableStateFlow<String?>(null)   // import/download message (progress or error)
+    val opText: StateFlow<String?> = _opText.asStateFlow()
+    private val _opFraction = MutableStateFlow(-1f)
+    val opFraction: StateFlow<Float> = _opFraction.asStateFlow()
+    private val _opBusy = MutableStateFlow(false)           // an import/download is running
+    val opBusy: StateFlow<Boolean> = _opBusy.asStateFlow()
+
     @Volatile var lastError: String? = null; private set
     @Volatile var modelPath: String? = null; private set
     @Volatile var lastTimingsJson: String? = null; private set
@@ -83,6 +101,10 @@ class InferenceService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        serviceScope.launch {
+            runCatching { repo.migrateLegacyModel() }
+            _models.value = runCatching { repo.listModels() }.getOrDefault(emptyList())
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -147,6 +169,7 @@ class InferenceService : Service() {
             }
             if (rc > 0L) {
                 handle = rc
+                _activeModelPath.value = path
                 _loadProgress.value = 1f
                 _modelName.value = runCatching {
                     NativeBridge.getModelInfo(path)?.let { JSONObject(it).optString("desc").ifBlank { null } }
@@ -164,7 +187,56 @@ class InferenceService : Service() {
         val h = handle
         if (h != 0L) { handle = 0L; runCatching { NativeBridge.freeModel(h) } }
         _modelName.value = null
+        _activeModelPath.value = null
         if (_status.value != Status.Error) _status.value = Status.Idle
+    }
+
+    // ---- Model management (import / download / delete) -----------------------
+
+    fun refreshModels() {
+        serviceScope.launch { _models.value = runCatching { repo.listModels() }.getOrDefault(emptyList()) }
+    }
+
+    fun importModel(uri: Uri) {
+        if (_opBusy.value) return
+        serviceScope.launch {
+            _opBusy.value = true; _opFraction.value = -1f; _opText.value = "Importing model…"
+            val res = repo.importFromUri(uri) { f ->
+                _opFraction.value = f
+                _opText.value = if (f >= 0) "Importing model… ${(f * 100).toInt()}%" else "Importing model…"
+            }
+            finishOp(res.isSuccess, res.exceptionOrNull()?.message, "Import failed")
+        }
+    }
+
+    fun downloadModel(url: String, name: String) {
+        if (_opBusy.value) return
+        serviceScope.launch {
+            _opBusy.value = true; _opFraction.value = -1f; _opText.value = "Downloading…"
+            val res = downloader.download(url, name) { p ->
+                _opFraction.value = p.fraction
+                _opText.value = if (p.fraction >= 0) "Downloading… ${(p.fraction * 100).toInt()}%"
+                                else "Downloading… ${formatBytes(p.downloadedBytes)}"
+            }
+            finishOp(res.isSuccess, res.exceptionOrNull()?.message, "Download failed")
+        }
+    }
+
+    fun deleteModel(entry: ModelEntry) {
+        serviceScope.launch {
+            if (entry.path == _activeModelPath.value) unloadModel()
+            runCatching { repo.delete(entry.file) }
+            _models.value = runCatching { repo.listModels() }.getOrDefault(emptyList())
+        }
+    }
+
+    fun dismissOpMessage() { if (!_opBusy.value) _opText.value = null }
+
+    private fun finishOp(success: Boolean, errorMsg: String?, failPrefix: String) {
+        _opFraction.value = -1f
+        _opBusy.value = false
+        _models.value = runCatching { repo.listModels() }.getOrDefault(emptyList())
+        _opText.value = if (success) null else "$failPrefix: ${errorMsg ?: "unknown error"}"
     }
 
     // ---- Generation (single in-flight request) ------------------------------

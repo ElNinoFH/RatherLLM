@@ -28,6 +28,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -41,9 +42,9 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -54,7 +55,6 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.MutableStateFlow
-import java.io.File
 
 class MainActivity : ComponentActivity() {
 
@@ -72,13 +72,15 @@ class MainActivity : ComponentActivity() {
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* FGS runs regardless */ }
 
-    // Legacy demo model; Stage 4 replaces this with a models/ directory + picker.
-    private val defaultModelPath: String by lazy { File(filesDir, "model.gguf").absolutePath }
+    private val openDocument =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            uri?.let { boundService.value?.importModel(it) }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestNotificationPermissionIfNeeded()
-        InferenceService.start(this) // start FGS; model load stays on-demand
+        InferenceService.start(this)
 
         setContent {
             MaterialTheme {
@@ -90,7 +92,18 @@ class MainActivity : ComponentActivity() {
                             Text("Connecting to engine…", color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     } else {
-                        ChatScreen(svc, defaultModelPath)
+                        var showModels by remember { mutableStateOf(false) }
+                        LaunchedEffect(showModels) { if (showModels) svc.refreshModels() }
+                        if (showModels) {
+                            ModelsHost(
+                                svc = svc,
+                                onBack = { svc.dismissOpMessage(); showModels = false },
+                                onImport = { openDocument.launch(arrayOf("*/*")) },
+                                onLoaded = { showModels = false },
+                            )
+                        } else {
+                            ChatScreen(svc, onOpenModels = { showModels = true })
+                        }
                     }
                 }
             }
@@ -116,12 +129,42 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun ChatScreen(svc: InferenceService, defaultModelPath: String) {
+private fun ModelsHost(
+    svc: InferenceService,
+    onBack: () -> Unit,
+    onImport: () -> Unit,
+    onLoaded: () -> Unit,
+) {
+    val models by svc.models.collectAsState()
+    val activePath by svc.activeModelPath.collectAsState()
+    val opText by svc.opText.collectAsState()
+    val opFraction by svc.opFraction.collectAsState()
+    val opBusy by svc.opBusy.collectAsState()
+
+    ModelsScreen(
+        models = models,
+        activeModelPath = activePath,
+        isBusy = opBusy,
+        busyText = opText,
+        busyFraction = opFraction,
+        ramRiskFor = { svc.repo.isRamRisky(it.sizeBytes) },
+        onBack = onBack,
+        onLoad = { entry -> svc.loadModel(entry.path); onLoaded() },
+        onDelete = { entry -> svc.deleteModel(entry) },
+        onImport = onImport,
+        onDownload = { url, name -> svc.downloadModel(url, name) },
+        onDownloadRecommended = { rec -> svc.downloadModel(rec.url, rec.fileName) },
+    )
+}
+
+@Composable
+private fun ChatScreen(svc: InferenceService, onOpenModels: () -> Unit) {
     val status by svc.status.collectAsState()
     val messages by svc.messages.collectAsState()
     val streamingText by svc.streamingText.collectAsState()
     val loadProgress by svc.loadProgress.collectAsState()
     val modelName by svc.modelName.collectAsState()
+    val models by svc.models.collectAsState()
     var input by remember { mutableStateOf("") }
 
     ChatContent(
@@ -129,14 +172,14 @@ private fun ChatScreen(svc: InferenceService, defaultModelPath: String) {
         errorText = svc.lastError,
         modelName = modelName,
         loadProgress = loadProgress,
-        modelAvailable = File(defaultModelPath).exists(),
+        hasModels = models.isNotEmpty(),
         messages = messages,
         streamingText = streamingText,
         input = input,
         onInputChange = { input = it },
         onSend = { svc.submit(input); input = "" },
         onStop = { svc.cancelGeneration() },
-        onLoadModel = { svc.loadModel(defaultModelPath) },
+        onOpenModels = onOpenModels,
     )
 }
 
@@ -147,14 +190,14 @@ private fun ChatContent(
     errorText: String?,
     modelName: String?,
     loadProgress: Float,
-    modelAvailable: Boolean,
+    hasModels: Boolean,
     messages: List<ChatMessage>,
     streamingText: String,
     input: String,
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
     onStop: () -> Unit,
-    onLoadModel: () -> Unit,
+    onOpenModels: () -> Unit,
 ) {
     val isGenerating = status == InferenceService.Status.Generating
     val listState = rememberLazyListState()
@@ -165,16 +208,23 @@ private fun ChatContent(
 
     Scaffold(
         topBar = {
-            TopAppBar(title = {
-                Column {
-                    Text("ratherllm", style = MaterialTheme.typography.titleLarge)
-                    Text(
-                        text = statusLine(status, modelName, errorText),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = statusColor(status),
-                    )
-                }
-            })
+            TopAppBar(
+                title = {
+                    Column {
+                        Text("ratherllm", style = MaterialTheme.typography.titleLarge)
+                        Text(
+                            text = statusLine(status, modelName, errorText),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = statusColor(status),
+                        )
+                    }
+                },
+                actions = {
+                    IconButton(onClick = onOpenModels) {
+                        Icon(Icons.Filled.Storage, contentDescription = "Models")
+                    }
+                },
+            )
         },
         bottomBar = {
             if (status == InferenceService.Status.Ready || isGenerating) {
@@ -191,12 +241,9 @@ private fun ChatContent(
     ) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
             when {
-                status == InferenceService.Status.Loading ->
-                    LoadingState(loadProgress)
-                messages.isEmpty() && !isGenerating ->
-                    EmptyState(status, errorText, modelAvailable, onLoadModel)
-                else ->
-                    MessageList(listState, messages, streamingText, isGenerating)
+                status == InferenceService.Status.Loading -> LoadingState(loadProgress)
+                messages.isEmpty() && !isGenerating -> EmptyState(status, errorText, hasModels, onOpenModels)
+                else -> MessageList(listState, messages, streamingText, isGenerating)
             }
         }
     }
@@ -222,31 +269,24 @@ private fun LoadingState(progress: Float) {
 private fun EmptyState(
     status: InferenceService.Status,
     errorText: String?,
-    modelAvailable: Boolean,
-    onLoadModel: () -> Unit,
+    hasModels: Boolean,
+    onOpenModels: () -> Unit,
 ) {
     Column(
         Modifier.fillMaxSize().padding(32.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        val headline = when (status) {
-            InferenceService.Status.Error -> errorText ?: "Something went wrong"
-            InferenceService.Status.Ready -> "Ready. Say something to begin."
-            else -> "No model loaded yet"
+        val headline = when {
+            status == InferenceService.Status.Error -> errorText ?: "Something went wrong"
+            status == InferenceService.Status.Ready -> "Ready. Say something to begin."
+            hasModels -> "No model loaded yet"
+            else -> "Welcome — add a model to start chatting"
         }
         Text(headline, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
         if (status != InferenceService.Status.Ready) {
-            Button(onClick = onLoadModel, enabled = modelAvailable, modifier = Modifier.padding(top = 16.dp)) {
-                Text(if (status == InferenceService.Status.Error) "Reload model" else "Load Gemma 3 4B")
-            }
-            if (!modelAvailable) {
-                Text(
-                    "Model file not found in app storage.",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.padding(top = 8.dp),
-                )
+            Button(onClick = onOpenModels, modifier = Modifier.padding(top = 16.dp)) {
+                Text(if (hasModels) "Choose a model" else "Add a model")
             }
         }
     }
@@ -358,32 +398,20 @@ private fun ChatReadyPreview() {
     MaterialTheme {
         ChatContent(
             status = InferenceService.Status.Ready, errorText = null, modelName = "gemma3 4B Q4_0",
-            loadProgress = 1f, modelAvailable = true, messages = sampleMessages(), streamingText = "",
-            input = "", onInputChange = {}, onSend = {}, onStop = {}, onLoadModel = {},
+            loadProgress = 1f, hasModels = true, messages = sampleMessages(), streamingText = "",
+            input = "", onInputChange = {}, onSend = {}, onStop = {}, onOpenModels = {},
         )
     }
 }
 
-@androidx.compose.ui.tooling.preview.Preview(showBackground = true, name = "Empty · load")
+@androidx.compose.ui.tooling.preview.Preview(showBackground = true, name = "Empty")
 @Composable
 private fun ChatEmptyPreview() {
     MaterialTheme {
         ChatContent(
             status = InferenceService.Status.Idle, errorText = null, modelName = null,
-            loadProgress = 0f, modelAvailable = true, messages = emptyList(), streamingText = "",
-            input = "", onInputChange = {}, onSend = {}, onStop = {}, onLoadModel = {},
-        )
-    }
-}
-
-@androidx.compose.ui.tooling.preview.Preview(showBackground = true, name = "Loading")
-@Composable
-private fun ChatLoadingPreview() {
-    MaterialTheme {
-        ChatContent(
-            status = InferenceService.Status.Loading, errorText = null, modelName = null,
-            loadProgress = 0.42f, modelAvailable = true, messages = emptyList(), streamingText = "",
-            input = "", onInputChange = {}, onSend = {}, onStop = {}, onLoadModel = {},
+            loadProgress = 0f, hasModels = false, messages = emptyList(), streamingText = "",
+            input = "", onInputChange = {}, onSend = {}, onStop = {}, onOpenModels = {},
         )
     }
 }
