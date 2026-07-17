@@ -43,7 +43,8 @@ fun formatBytes(bytes: Long): String {
     val units = arrayOf("B", "KB", "MB", "GB", "TB")
     var v = bytes.toDouble(); var i = 0
     while (v >= 1024 && i < units.lastIndex) { v /= 1024; i++ }
-    return if (i >= 3) String.format("%.1f %s", v, units[i]) else String.format("%.0f %s", v, units[i])
+    val loc = java.util.Locale.US
+    return if (i >= 3) String.format(loc, "%.1f %s", v, units[i]) else String.format(loc, "%.0f %s", v, units[i])
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -260,8 +261,8 @@ private fun UrlDownloadDialog(onDismiss: () -> Unit, onConfirm: (String, String)
 }
 
 private fun formatParams(n: Long): String = when {
-    n >= 1_000_000_000 -> String.format("%.1fB", n / 1e9)
-    n >= 1_000_000 -> String.format("%.0fM", n / 1e6)
+    n >= 1_000_000_000 -> String.format(java.util.Locale.US, "%.1fB", n / 1e9)
+    n >= 1_000_000 -> String.format(java.util.Locale.US, "%.0fM", n / 1e6)
     else -> n.toString()
 }
 
