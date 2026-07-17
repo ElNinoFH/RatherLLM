@@ -1,4 +1,6 @@
 plugins {
+    // AGP 9.0+ provides built-in Kotlin support, so the standalone
+    // org.jetbrains.kotlin.android plugin must NOT be applied here.
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
@@ -49,7 +51,6 @@ android {
         }
     }
     buildFeatures {
-        viewBinding = true
         compose = true
     }
 }

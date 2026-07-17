@@ -1,6 +1,5 @@
 package com.kotlin.ratherllm
 
-import androidx.compose.ui.tooling.preview.Preview
 import android.Manifest
 import android.content.ComponentName
 import android.content.Context
@@ -29,7 +28,6 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -40,10 +38,9 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.State
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -57,19 +54,11 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import java.io.File
 
-/** UI-side chat model. */
-private enum class Author { User, Assistant }
-
-private data class ChatMessage(val author: Author, val text: String)
-
 class MainActivity : ComponentActivity() {
 
-    // Bound service exposed to Compose as a StateFlow so the UI recomposes
-    // when the connection is established / torn down.
     private val boundService = MutableStateFlow<InferenceService?>(null)
 
     private val connection = object : ServiceConnection {
@@ -82,22 +71,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // POST_NOTIFICATIONS runtime permission (API 33+). Granting it makes the
-    // foreground-service notification — and thus the priority-bucket promotion
-    // that keeps HyperOS from reclaiming us — reliable.
     private val notificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* FGS runs regardless */ }
 
-    // Demo model location; push a GGUF here (e.g. via `adb push … /files/model.gguf`).
+    // Legacy demo location; Stage 4 introduces the models/ directory + picker.
     private val modelPath: String by lazy { File(filesDir, "model.gguf").absolutePath }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         requestNotificationPermissionIfNeeded()
-
-        // Start the foreground service, which brings up the native engine.
-        InferenceService.start(this, modelPath, useNeuropilot = true)
+        InferenceService.start(this, modelPath)
 
         setContent {
             MaterialTheme {
@@ -111,11 +94,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        bindService(
-            Intent(this, InferenceService::class.java),
-            connection,
-            Context.BIND_AUTO_CREATE,
-        )
+        bindService(Intent(this, InferenceService::class.java), connection, Context.BIND_AUTO_CREATE)
     }
 
     override fun onStop() {
@@ -125,13 +104,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestNotificationPermissionIfNeeded() {
-        // minSdk is 34, so POST_NOTIFICATIONS always applies.
-        val granted = ContextCompat.checkSelfPermission(
-            this, Manifest.permission.POST_NOTIFICATIONS,
-        ) == PackageManager.PERMISSION_GRANTED
-        if (!granted) {
-            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-        }
+        val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        if (!granted) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 }
 
@@ -146,39 +121,40 @@ private fun ChatScreen(service: InferenceService?) {
 
     var status by remember { mutableStateOf(InferenceService.Status.Idle) }
     LaunchedEffect(service) {
-        status = InferenceService.Status.Idle
+        status = service?.status?.value ?: InferenceService.Status.Idle
         service?.status?.collect { status = it }
     }
 
     fun send() {
         val prompt = input.trim()
         val svc = service
-        if (prompt.isEmpty() || isStreaming || svc == null || status != InferenceService.Status.Ready) return
+        if (prompt.isEmpty() || isStreaming || svc == null || !svc.isReady) return
 
         input = ""
-        messages.add(ChatMessage(Author.User, prompt))
+        messages.add(ChatMessage(Role.User, prompt))
         streamingText = ""
         isStreaming = true
 
+        val history = messages.toList()
         scope.launch {
             val sb = StringBuilder()
             try {
-                svc.streamTokens(prompt).collect { chunk ->
+                svc.streamTokens(history).collect { chunk ->
                     if (chunk.text.isNotEmpty()) {
                         sb.append(chunk.text)
                         streamingText = sb.toString()
                     }
                     if (chunk.final) {
-                        messages.add(ChatMessage(Author.Assistant, sb.toString()))
+                        messages.add(ChatMessage(Role.Assistant, sb.toString()))
                         streamingText = ""
                         isStreaming = false
                     }
                 }
             } catch (e: Exception) {
-                messages.add(ChatMessage(Author.Assistant, "⚠️ stream error: ${e.message}"))
+                messages.add(ChatMessage(Role.Assistant, "⚠️ ${e.message}"))
             } finally {
                 if (isStreaming) {
-                    if (sb.isNotEmpty()) messages.add(ChatMessage(Author.Assistant, sb.toString()))
+                    if (sb.isNotEmpty()) messages.add(ChatMessage(Role.Assistant, sb.toString()))
                     streamingText = ""
                     isStreaming = false
                 }
@@ -188,6 +164,7 @@ private fun ChatScreen(service: InferenceService?) {
 
     ChatContent(
         status = status,
+        errorText = service?.lastError,
         bound = service != null,
         messages = messages,
         streamingText = streamingText,
@@ -202,6 +179,7 @@ private fun ChatScreen(service: InferenceService?) {
 @Composable
 private fun ChatContent(
     status: InferenceService.Status,
+    errorText: String?,
     bound: Boolean,
     messages: List<ChatMessage>,
     streamingText: String,
@@ -219,10 +197,11 @@ private fun ChatContent(
     Scaffold(
         topBar = {
             TopAppBar(title = {
-                androidx.compose.foundation.layout.Column {
+                Column {
                     Text("ratherllm", style = MaterialTheme.typography.titleLarge)
                     Text(
-                        text = statusLabel(status, bound),
+                        text = if (status == InferenceService.Status.Error && !errorText.isNullOrBlank())
+                            errorText else statusLabel(status, bound),
                         style = MaterialTheme.typography.labelSmall,
                         color = statusColor(status),
                     )
@@ -238,21 +217,25 @@ private fun ChatContent(
             )
         },
     ) { padding ->
-        LazyColumn(
-            state = listState,
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .padding(horizontal = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-            contentPadding = PaddingValues(vertical = 12.dp),
-        ) {
-            itemsIndexed(messages) { _, msg ->
-                MessageBubble(author = msg.author, text = msg.text)
+        if (messages.isEmpty() && !isStreaming) {
+            Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
+                Text(
+                    text = emptyStateText(status, errorText),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(32.dp),
+                )
             }
-            if (isStreaming) {
-                item {
-                    MessageBubble(author = Author.Assistant, text = streamingText, showCaret = true)
+        } else {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                contentPadding = PaddingValues(vertical = 12.dp),
+            ) {
+                itemsIndexed(messages) { _, msg -> MessageBubble(msg.role, msg.text) }
+                if (isStreaming) {
+                    item { MessageBubble(Role.Assistant, streamingText, showCaret = true) }
                 }
             }
         }
@@ -260,24 +243,18 @@ private fun ChatContent(
 }
 
 @Composable
-private fun MessageBubble(author: Author, text: String, showCaret: Boolean = false) {
-    val isUser = author == Author.User
+private fun MessageBubble(role: Role, text: String, showCaret: Boolean = false) {
+    val isUser = role == Role.User
     val bubbleColor =
-        if (isUser) MaterialTheme.colorScheme.primaryContainer
-        else MaterialTheme.colorScheme.surfaceVariant
+        if (isUser) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
     val textColor =
-        if (isUser) MaterialTheme.colorScheme.onPrimaryContainer
-        else MaterialTheme.colorScheme.onSurfaceVariant
+        if (isUser) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
 
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
     ) {
-        Surface(
-            color = bubbleColor,
-            shape = RoundedCornerShape(16.dp),
-            modifier = Modifier.widthIn(max = 320.dp),
-        ) {
+        Surface(color = bubbleColor, shape = RoundedCornerShape(16.dp), modifier = Modifier.widthIn(max = 320.dp)) {
             Box(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                 Text(
                     text = if (showCaret && text.isEmpty()) "▌" else if (showCaret) "$text▌" else text,
@@ -291,17 +268,10 @@ private fun MessageBubble(author: Author, text: String, showCaret: Boolean = fal
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun InputBar(
-    value: String,
-    onValueChange: (String) -> Unit,
-    enabled: Boolean,
-    onSend: () -> Unit,
-) {
+private fun InputBar(value: String, onValueChange: (String) -> Unit, enabled: Boolean, onSend: () -> Unit) {
     Surface(tonalElevation = 3.dp) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 8.dp),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
@@ -309,7 +279,7 @@ private fun InputBar(
                 value = value,
                 onValueChange = onValueChange,
                 modifier = Modifier.weight(1f),
-                placeholder = { Text(if (enabled) "Ask anything…" else "Waiting for engine…") },
+                placeholder = { Text(if (enabled) "Ask anything…" else "Engine not ready") },
                 enabled = enabled,
                 maxLines = 4,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
@@ -325,9 +295,17 @@ private fun InputBar(
 private fun statusLabel(status: InferenceService.Status, bound: Boolean): String = when {
     !bound -> "connecting to service…"
     status == InferenceService.Status.Idle -> "idle"
-    status == InferenceService.Status.Starting -> "loading model & locking weights…"
-    status == InferenceService.Status.Ready -> "ready · weights resident"
+    status == InferenceService.Status.Loading -> "loading model…"
+    status == InferenceService.Status.Ready -> "ready"
+    status == InferenceService.Status.Generating -> "generating…"
     else -> "error"
+}
+
+private fun emptyStateText(status: InferenceService.Status, errorText: String?): String = when (status) {
+    InferenceService.Status.Error -> errorText ?: "Engine error"
+    InferenceService.Status.Loading -> "Loading model…"
+    InferenceService.Status.Ready -> "Ready. Say something to begin."
+    else -> "Starting engine…"
 }
 
 @Composable
@@ -338,26 +316,17 @@ private fun statusColor(status: InferenceService.Status): Color = when (status) 
 }
 
 private fun sampleMessages(): List<ChatMessage> = listOf(
-    ChatMessage(Author.User, "What SoC am I running on?"),
-    ChatMessage(
-        Author.Assistant,
-        "You're on the MediaTek Dimensity 9500s (MT6991Z) — an all-big-core ARMv9.2-A layout: " +
-            "1× Cortex-X925 @ 3.73 GHz, 3× Cortex-X4, and 4× Cortex-A720.",
-    ),
-    ChatMessage(Author.User, "Are the model weights locked in RAM?"),
-    ChatMessage(
-        Author.Assistant,
-        "Yes — the engine mmaps the GGUF file and mlock()s the arena, with MADV_WILLNEED " +
-            "pre-faulting, so HyperOS's LMK can't reclaim the hot pages mid-decode.",
-    ),
+    ChatMessage(Role.User, "What SoC am I running on?"),
+    ChatMessage(Role.Assistant, "You're on the MediaTek Dimensity 9500 (MT6991): 1× Cortex-X925 prime + 3× X4 + 4× A720, ARMv9.2-A."),
 )
 
-@Preview(showBackground = true, name = "Chat · Ready")
+@androidx.compose.ui.tooling.preview.Preview(showBackground = true, name = "Chat · Ready")
 @Composable
 private fun ChatContentReadyPreview() {
     MaterialTheme {
         ChatContent(
             status = InferenceService.Status.Ready,
+            errorText = null,
             bound = true,
             messages = sampleMessages(),
             streamingText = "",
@@ -369,29 +338,13 @@ private fun ChatContentReadyPreview() {
     }
 }
 
-@Preview(showBackground = true, name = "Chat · Streaming")
+@androidx.compose.ui.tooling.preview.Preview(showBackground = true, name = "Chat · Error")
 @Composable
-private fun ChatContentStreamingPreview() {
+private fun ChatContentErrorPreview() {
     MaterialTheme {
         ChatContent(
-            status = InferenceService.Status.Ready,
-            bound = true,
-            messages = sampleMessages(),
-            streamingText = "The X925 prime core runs the autoregressive decode while the X4 cores handle prefill",
-            isStreaming = true,
-            input = "Explain the token pipeline",
-            onInputChange = {},
-            onSend = {},
-        )
-    }
-}
-
-@Preview(showBackground = true, name = "Chat · Loading")
-@Composable
-private fun ChatContentLoadingPreview() {
-    MaterialTheme {
-        ChatContent(
-            status = InferenceService.Status.Starting,
+            status = InferenceService.Status.Error,
+            errorText = "Engine not implemented yet (Stage 1 skeleton)",
             bound = true,
             messages = emptyList(),
             streamingText = "",
