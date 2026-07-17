@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -30,8 +31,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Stop
@@ -65,6 +68,8 @@ import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -216,6 +221,7 @@ private fun ChatScreen(svc: InferenceService, onOpenModels: () -> Unit) {
             onOpenSettings = { showSettings = true },
             onOpenDrawer = { scope.launch { drawerState.open() } },
             onNewChat = { svc.newConversation() },
+            onRegenerate = { svc.regenerateLast() },
         )
         if (showSettings) {
             SettingsSheet(
@@ -279,6 +285,7 @@ private fun ChatContent(
     onOpenSettings: () -> Unit,
     onOpenDrawer: () -> Unit,
     onNewChat: () -> Unit,
+    onRegenerate: () -> Unit,
 ) {
     val isGenerating = status == InferenceService.Status.Generating
     val listState = rememberLazyListState()
@@ -335,7 +342,7 @@ private fun ChatContent(
             when {
                 status == InferenceService.Status.Loading -> LoadingState(loadProgress)
                 messages.isEmpty() && !isGenerating -> EmptyState(status, errorText, hasModels, onOpenModels)
-                else -> MessageList(listState, messages, streamingText, isGenerating)
+                else -> MessageList(listState, messages, streamingText, isGenerating, onRegenerate)
             }
         }
     }
@@ -390,7 +397,9 @@ private fun MessageList(
     messages: List<ChatMessage>,
     streamingText: String,
     isGenerating: Boolean,
+    onRegenerate: () -> Unit,
 ) {
+    val clipboard = LocalClipboardManager.current
     LazyColumn(
         state = listState,
         modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp),
@@ -400,6 +409,19 @@ private fun MessageList(
         itemsIndexed(messages) { _, msg -> MessageBubble(msg.role, msg.text) }
         if (isGenerating) {
             item { MessageBubble(Role.Assistant, streamingText, showCaret = true) }
+        }
+        val last = messages.lastOrNull()
+        if (!isGenerating && last != null && last.role == Role.Assistant) {
+            item {
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    IconButton(onClick = { clipboard.setText(AnnotatedString(last.text)) }) {
+                        Icon(Icons.Filled.ContentCopy, contentDescription = "Copy message", modifier = Modifier.size(18.dp))
+                    }
+                    IconButton(onClick = onRegenerate) {
+                        Icon(Icons.Filled.Refresh, contentDescription = "Regenerate", modifier = Modifier.size(18.dp))
+                    }
+                }
+            }
         }
     }
 }
@@ -498,7 +520,7 @@ private fun ChatReadyPreview() {
             status = InferenceService.Status.Ready, errorText = null, modelName = "gemma3 4B Q4_0", decodeTps = 8.2f,
             loadProgress = 1f, hasModels = true, messages = sampleMessages(), streamingText = "",
             input = "", onInputChange = {}, onSend = {}, onStop = {}, onOpenModels = {}, onOpenSettings = {},
-            onOpenDrawer = {}, onNewChat = {},
+            onOpenDrawer = {}, onNewChat = {}, onRegenerate = {},
         )
     }
 }
@@ -511,7 +533,7 @@ private fun ChatEmptyPreview() {
             status = InferenceService.Status.Idle, errorText = null, modelName = null, decodeTps = null,
             loadProgress = 0f, hasModels = false, messages = emptyList(), streamingText = "",
             input = "", onInputChange = {}, onSend = {}, onStop = {}, onOpenModels = {}, onOpenSettings = {},
-            onOpenDrawer = {}, onNewChat = {},
+            onOpenDrawer = {}, onNewChat = {}, onRegenerate = {},
         )
     }
 }

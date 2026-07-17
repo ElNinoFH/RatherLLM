@@ -35,9 +35,15 @@ android {
 
     buildTypes {
         release {
-            optimization {
-                enable = false
-            }
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+            // Sign the release APK with the debug key so it installs for smoke
+            // testing (not for distribution).
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {

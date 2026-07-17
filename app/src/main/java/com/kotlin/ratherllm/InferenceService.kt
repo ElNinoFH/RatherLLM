@@ -184,7 +184,7 @@ class InferenceService : Service() {
                         path = path,
                         nCtx = DEFAULT_CTX,
                         nThreads = DEFAULT_THREADS,
-                        nThreadsBatch = DEFAULT_THREADS,
+                        nThreadsBatch = DEFAULT_THREADS_BATCH,
                         nGpuLayers = 0,
                         useMlock = false,
                         progress = { p -> _loadProgress.value = p },
@@ -318,6 +318,17 @@ class InferenceService : Service() {
         val h = handle
         if (h != 0L) runCatching { NativeBridge.cancel(h) } // trip native flag now (<1 token)
         genJob?.cancel()
+    }
+
+    /** Drop the last assistant reply and re-run the last user turn. */
+    fun regenerateLast() {
+        if (!isReady || _status.value == Status.Generating) return
+        val msgs = _messages.value
+        val lastUserIdx = msgs.indexOfLast { it.role == Role.User }
+        if (lastUserIdx < 0) return
+        val userText = msgs[lastUserIdx].text
+        _messages.value = msgs.take(lastUserIdx)
+        submit(userText)
     }
 
     fun newConversation() {
@@ -478,7 +489,11 @@ class InferenceService : Service() {
         const val ACTION_CANCEL = "com.kotlin.ratherllm.action.CANCEL_GEN"
 
         private const val DEFAULT_CTX = 4096
+        // Benchmarked on the MT6991: decode is memory-bound and fastest on the 4
+        // big cores only (4 thr = 11.0 tok/s vs 8 thr = 7.7 for Gemma 3 4B Q4_0);
+        // prefill is compute-bound and gains from all 8 cores.
         private const val DEFAULT_THREADS = 4
+        private const val DEFAULT_THREADS_BATCH = 8
 
         fun start(context: Context) {
             context.startForegroundService(Intent(context, InferenceService::class.java))

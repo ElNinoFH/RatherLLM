@@ -79,16 +79,24 @@ fun ModelsScreen(
         },
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).padding(horizontal = 16.dp)) {
-            if (isBusy) {
+            // Show progress while busy, and keep an error message visible after the
+            // op ends (it stays until the user goes back or starts another op).
+            if (busyText != null) {
                 Column(Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
-                    Text(busyText ?: "Working…", style = MaterialTheme.typography.bodyMedium)
-                    if (busyFraction >= 0f) {
-                        LinearProgressIndicator(
-                            progress = { busyFraction.coerceIn(0f, 1f) },
-                            modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
-                        )
-                    } else {
-                        LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 6.dp))
+                    Text(
+                        busyText,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (isBusy) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.error,
+                    )
+                    if (isBusy) {
+                        if (busyFraction >= 0f) {
+                            LinearProgressIndicator(
+                                progress = { busyFraction.coerceIn(0f, 1f) },
+                                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                            )
+                        } else {
+                            LinearProgressIndicator(Modifier.fillMaxWidth().padding(top = 6.dp))
+                        }
                     }
                 }
             }
