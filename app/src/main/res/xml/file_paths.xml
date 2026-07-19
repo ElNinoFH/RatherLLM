@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Exported conversations live under cacheDir/exports and are shared read-only
+         via the app's FileProvider. -->
+    <cache-path name="exports" path="exports/" />
+    <!-- Camera captures are written here via a FileProvider URI, then referenced
+         by the chat message that attached them. -->
+    <cache-path name="attachments" path="attachments/" />
+</paths>

@@ -1,10 +1,76 @@
 package com.kotlin.ratherllm
 
+import java.util.UUID
+
 /** Conversation roles, mapped to chat-template roles in native code. */
 enum class Role(val wire: String) { System("system"), User("user"), Assistant("assistant") }
 
-/** A single chat turn. */
-data class ChatMessage(val role: Role, val text: String)
+/**
+ * A single chat turn. [id] is stable so replies can be saved/unsaved and matched
+ * across recompositions; [tps] and [modelName] annotate assistant turns (the model
+ * that produced them and its decode rate) for the design's per-message metadata.
+ */
+data class ChatMessage(
+    val role: Role,
+    val text: String,
+    val id: String = UUID.randomUUID().toString(),
+    val tps: Float? = null,
+    val modelName: String? = null,
+    val attachments: List<Attachment> = emptyList(),
+)
+
+/** Whether an [Attachment] is a picture (shown as a thumbnail) or a generic file. */
+enum class AttachmentKind(val wire: String) {
+    Image("image"), File("file");
+
+    companion object {
+        fun fromWire(w: String): AttachmentKind = entries.firstOrNull { it.wire == w } ?: File
+    }
+}
+
+/**
+ * A file or photo the user attached to a message. [path] is an absolute path to a
+ * copy the app owns (under cacheDir/attachments), so it survives the transient
+ * content:// permission of the picker/camera that produced it.
+ */
+data class Attachment(
+    val kind: AttachmentKind,
+    val path: String,
+    val name: String,
+    val mime: String = "",
+)
+
+/** Multimodal capabilities a model may advertise (mirrors the design's Text/Image/Audio/Video). */
+enum class ModelCapability(val key: String, val label: String) {
+    Text("text", "Text"), Image("image", "Image"), Audio("audio", "Audio"), Video("video", "Video");
+
+    companion object {
+        fun fromKeys(keys: Set<String>): Set<ModelCapability> = entries.filter { it.key in keys }.toSet()
+    }
+}
+
+/**
+ * User-editable, per-model metadata not derivable from the GGUF header: a short
+ * description shown in the picker, declared capabilities, and an optional paired
+ * mmproj (vision/multimodal projector) file name. Keyed by model file name.
+ */
+data class ModelMeta(
+    val description: String = "",
+    val capabilities: Set<ModelCapability> = setOf(ModelCapability.Text),
+    val mmproj: String? = null,
+)
+
+/** A bookmarked assistant reply, shown in the drawer's "Saved replies" section. */
+data class SavedReply(
+    val messageId: String,
+    val text: String,
+    val conversationId: String,
+    val conversationTitle: String,
+    val savedAt: Long = System.currentTimeMillis(),
+)
+
+/** A live device-analytics sample (only produced while analytics is enabled). */
+data class DeviceStats(val cpuPercent: Int, val ramPercent: Int, val tempCelsius: Int)
 
 /**
  * Sampling / generation parameters passed to the native engine. Defaults follow

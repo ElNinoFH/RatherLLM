@@ -22,12 +22,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.io.File
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.coroutineContext
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -84,10 +87,50 @@ class InferenceService : Service() {
     private val _opBusy = MutableStateFlow(false)           // an import/download is running
     val opBusy: StateFlow<Boolean> = _opBusy.asStateFlow()
 
+    /** The just-imported model, so the import-config popup can configure it. */
+    private val _lastImported = MutableStateFlow<ModelEntry?>(null)
+    val lastImported: StateFlow<ModelEntry?> = _lastImported.asStateFlow()
+
     // ---- Conversation history -----------------------------------------------
     private val store: ConversationStore by lazy { ConversationStore(this) }
     private val _conversations = MutableStateFlow<List<Conversation>>(emptyList())
     val conversations: StateFlow<List<Conversation>> = _conversations.asStateFlow()
+
+    // ---- New feature backends (saved replies, model meta, settings, analytics) --
+    private val savedStore: SavedReplyStore by lazy { SavedReplyStore(this) }
+    private val metaStore: ModelMetaStore by lazy { ModelMetaStore(this) }
+    val settingsStore: AppSettingsStore by lazy { AppSettingsStore(this) }
+    private val analytics: DeviceAnalytics by lazy { DeviceAnalytics(this) }
+
+    private val _savedReplies = MutableStateFlow<List<SavedReply>>(emptyList())
+    val savedReplies: StateFlow<List<SavedReply>> = _savedReplies.asStateFlow()
+
+    /** Per-model editable metadata (desc/caps/mmproj), keyed by file name. */
+    private val _modelMetas = MutableStateFlow<Map<String, ModelMeta>>(emptyMap())
+    val modelMetas: StateFlow<Map<String, ModelMeta>> = _modelMetas.asStateFlow()
+
+    private val _deviceStats = MutableStateFlow<DeviceStats?>(null)
+    val deviceStats: StateFlow<DeviceStats?> = _deviceStats.asStateFlow()
+    private val _analyticsEnabled = MutableStateFlow(false)
+    val analyticsEnabled: StateFlow<Boolean> = _analyticsEnabled.asStateFlow()
+    private var analyticsJob: Job? = null
+
+    private val _experimentalEnabled = MutableStateFlow(false)
+    val experimentalEnabled: StateFlow<Boolean> = _experimentalEnabled.asStateFlow()
+    private val _maximizeMemory = MutableStateFlow(false)
+    val maximizeMemory: StateFlow<Boolean> = _maximizeMemory.asStateFlow()
+    private val _multiResponse = MutableStateFlow(false)
+    val multiResponse: StateFlow<Boolean> = _multiResponse.asStateFlow()
+
+    /** Paths chosen for multi-response mode (each answers, back to back). */
+    private val _multiSelectedPaths = MutableStateFlow<List<String>>(emptyList())
+    val multiSelectedPaths: StateFlow<List<String>> = _multiSelectedPaths.asStateFlow()
+
+    /** While a multi-response batch runs, how many models remain after the current one. */
+    private val _multiRemaining = MutableStateFlow(0)
+    val multiRemaining: StateFlow<Int> = _multiRemaining.asStateFlow()
+    private val _streamingModelName = MutableStateFlow<String?>(null)
+    val streamingModelName: StateFlow<String?> = _streamingModelName.asStateFlow()
 
     private val _currentId = MutableStateFlow("")
     val currentConversationId: StateFlow<String> = _currentId.asStateFlow()
@@ -99,9 +142,11 @@ class InferenceService : Service() {
     @Volatile var modelPath: String? = null; private set
     @Volatile var lastTimingsJson: String? = null; private set
 
-    /** User-tunable generation settings (Stage 5 exposes these in the UI). */
+    /** User-tunable generation settings, persisted so they survive restarts. */
     @Volatile var genParams: GenParams = GenParams()
+        set(value) { field = value; runCatching { settingsStore.saveGenParams(value) } }
     @Volatile var systemPrompt: String = ""
+        set(value) { field = value; runCatching { settingsStore.systemPrompt = value } }
 
     @Volatile private var handle: Long = 0L
     private var loadJob: Job? = null
@@ -115,9 +160,19 @@ class InferenceService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        // Restore persisted user settings synchronously (cheap SharedPreferences reads).
+        runCatching {
+            genParams = settingsStore.loadGenParams()
+            systemPrompt = settingsStore.systemPrompt
+            _experimentalEnabled.value = settingsStore.experimentalEnabled
+            _maximizeMemory.value = settingsStore.maximizeMemory && settingsStore.experimentalEnabled
+            _multiResponse.value = settingsStore.multiResponse && settingsStore.experimentalEnabled
+        }
         serviceScope.launch {
             runCatching { repo.migrateLegacyModel() }
-            _models.value = runCatching { repo.listModels() }.getOrDefault(emptyList())
+            reloadModels()
+            _savedReplies.value = runCatching { savedStore.load() }.getOrDefault(emptyList())
+            if (settingsStore.analyticsEnabled) setAnalyticsEnabled(true)
             val convos = runCatching { store.load() }.getOrDefault(emptyList())
             if (convos.isNotEmpty()) {
                 _conversations.value = convos
@@ -186,7 +241,10 @@ class InferenceService : Service() {
                         nThreads = DEFAULT_THREADS,
                         nThreadsBatch = DEFAULT_THREADS_BATCH,
                         nGpuLayers = 0,
-                        useMlock = false,
+                        // Maximize memory allocation → mlock the weights so they stay
+                        // resident in physical RAM (best-effort; llama.cpp warns and
+                        // continues if the lock can't be taken).
+                        useMlock = _maximizeMemory.value,
                         progress = { p -> _loadProgress.value = p },
                     )
                 }.getOrElse { -1L }
@@ -218,19 +276,70 @@ class InferenceService : Service() {
     // ---- Model management (import / download / delete) -----------------------
 
     fun refreshModels() {
-        serviceScope.launch { _models.value = runCatching { repo.listModels() }.getOrDefault(emptyList()) }
+        serviceScope.launch { reloadModels() }
+    }
+
+    /** Lists model files and rebuilds the metadata map (desc/caps/mmproj) in lockstep. */
+    private fun reloadModels() {
+        val list = runCatching { repo.listModels() }.getOrDefault(emptyList())
+        _models.value = list
+        _modelMetas.value = list.associate { it.name to (metaStore.get(it.name) ?: defaultMetaFor(it)) }
+    }
+
+    /** A sensible default meta for a model that has never been configured. */
+    private fun defaultMetaFor(entry: ModelEntry): ModelMeta = ModelMeta()
+
+    fun updateModelMeta(fileName: String, meta: ModelMeta) {
+        metaStore.put(fileName, meta)
+        _modelMetas.value = _modelMetas.value + (fileName to meta)
     }
 
     fun importModel(uri: Uri) {
         if (_opBusy.value) return
         serviceScope.launch {
             _opBusy.value = true; _opFraction.value = -1f; _opText.value = "Importing model…"
+            _lastImported.value = null
             val res = repo.importFromUri(uri) { f ->
                 _opFraction.value = f
                 _opText.value = if (f >= 0) "Importing model… ${(f * 100).toInt()}%" else "Importing model…"
             }
             finishOp(res.isSuccess, res.exceptionOrNull()?.message, "Import failed")
+            // Surface the finished entry so the config popup can open on it.
+            if (res.isSuccess) {
+                val path = res.getOrNull()?.absolutePath
+                _lastImported.value = _models.value.find { it.path == path }
+            }
         }
+    }
+
+    fun clearLastImported() { _lastImported.value = null }
+
+    /**
+     * Imports a vision/multimodal projector (mmproj) GGUF into the companion store
+     * and invokes [onDone] on the main thread with its stored file name (or null).
+     */
+    fun importMmproj(uri: Uri, onDone: (String?) -> Unit) {
+        serviceScope.launch {
+            val res = runCatching { repo.importMmproj(uri) }.getOrElse { Result.failure(it) }
+            val name = res.getOrNull()?.name
+            withContext(Dispatchers.Main) { onDone(name) }
+        }
+    }
+
+    /**
+     * A best-effort hint that a model's architecture is a known multimodal/vision
+     * family, used only to pre-suggest the Image capability — the user still
+     * confirms it with the checkbox at upload.
+     */
+    fun looksMultimodal(entry: ModelEntry?): Boolean {
+        val arch = entry?.info?.arch?.lowercase() ?: return false
+        val name = entry.name.lowercase()
+        val hints = listOf(
+            "llava", "vl", "vision", "mmproj", "minicpmv", "minicpm-v", "moondream",
+            "smolvlm", "internvl", "pixtral", "idefics", "mllama", "mobilevlm",
+            "gemma3", "qwen2vl", "qwen2.5vl", "llama4", "cogvlm", "bunny", "glm-4v",
+        )
+        return hints.any { arch.contains(it) || name.contains(it) }
     }
 
     fun downloadModel(url: String, name: String) {
@@ -250,7 +359,9 @@ class InferenceService : Service() {
         serviceScope.launch {
             if (entry.path == _activeModelPath.value) unloadModel()
             runCatching { repo.delete(entry.file) }
-            _models.value = runCatching { repo.listModels() }.getOrDefault(emptyList())
+            runCatching { metaStore.remove(entry.name) }
+            _multiSelectedPaths.value = _multiSelectedPaths.value.filter { it != entry.path }
+            reloadModels()
         }
     }
 
@@ -259,17 +370,53 @@ class InferenceService : Service() {
     private fun finishOp(success: Boolean, errorMsg: String?, failPrefix: String) {
         _opFraction.value = -1f
         _opBusy.value = false
-        _models.value = runCatching { repo.listModels() }.getOrDefault(emptyList())
+        reloadModels()
         _opText.value = if (success) null else "$failPrefix: ${errorMsg ?: "unknown error"}"
     }
 
     // ---- Generation (single in-flight request) ------------------------------
 
-    fun submit(userText: String) {
-        val text = userText.trim()
-        if (text.isEmpty() || !isReady) return
+    private data class StreamResult(val text: String, val tps: Float?, val rc: Int)
 
-        val convo = _messages.value + ChatMessage(Role.User, text)
+    /** Runs one native generation, streaming into [_streamingText] via [sb]. */
+    private suspend fun streamOnce(h: Long, requestJson: String, sb: StringBuilder): StreamResult {
+        val job = coroutineContext[Job]
+        val rc = withContext(Dispatchers.Default) {
+            NativeBridge.generate(h, requestJson, TokenCallback { piece ->
+                sb.append(piece)
+                _streamingText.value = sb.toString()
+                job?.isActive != false
+            })
+        }
+        lastTimingsJson = runCatching { NativeBridge.lastTimings(h) }.getOrNull()
+        val tps = lastTimingsJson?.let {
+            runCatching { JSONObject(it).optDouble("decodeTokPerSec").toFloat().takeIf { v -> v > 0f } }.getOrNull()
+        }
+        _lastDecodeTps.value = tps
+        return StreamResult(sb.toString(), tps, rc)
+    }
+
+    fun submit(userText: String, attachments: List<Attachment> = emptyList()) {
+        val text = userText.trim()
+        if (text.isEmpty() && attachments.isEmpty()) return
+        if (_status.value == Status.Generating) return
+
+        // Multi-response mode: several selected models answer the same prompt in turn.
+        val multiPaths = if (_multiResponse.value) {
+            _multiSelectedPaths.value.filter { it.isNotBlank() }.distinct()
+        } else emptyList()
+        when {
+            // Two+ models → run the sequential batch.
+            multiPaths.size > 1 -> { submitMulti(text, multiPaths, attachments); return }
+            // Exactly one selected but it isn't the loaded/ready model → route through
+            // submitMulti so it gets loaded first instead of dropping the message.
+            multiPaths.size == 1 && !(isReady && _activeModelPath.value == multiPaths[0]) -> {
+                submitMulti(text, multiPaths, attachments); return
+            }
+        }
+        if (!isReady) return
+
+        val convo = _messages.value + ChatMessage(Role.User, text, attachments = attachments)
         _messages.value = convo
         persistCurrent()
         _status.value = Status.Generating
@@ -279,28 +426,17 @@ class InferenceService : Service() {
         val h = handle
         val request = buildRequestJson(convo)
         genJob = serviceScope.launch {
-            val job = coroutineContext[Job]
             val sb = StringBuilder()
             try {
-                val rc = withContext(Dispatchers.Default) {
-                    NativeBridge.generate(h, request, TokenCallback { piece ->
-                        sb.append(piece)
-                        _streamingText.value = sb.toString()
-                        job?.isActive != false
-                    })
-                }
-                lastTimingsJson = runCatching { NativeBridge.lastTimings(h) }.getOrNull()
-                _lastDecodeTps.value = lastTimingsJson?.let {
-                    runCatching { JSONObject(it).optDouble("decodeTokPerSec").toFloat().takeIf { v -> v > 0f } }.getOrNull()
-                }
-                val out = sb.toString()
+                val r = streamOnce(h, request, sb)
                 _messages.value = _messages.value + when {
-                    out.isNotEmpty()  -> ChatMessage(Role.Assistant, out)
-                    rc < 0            -> ChatMessage(Role.Assistant, "⚠️ ${Rc.message(rc)}")
-                    else              -> ChatMessage(Role.Assistant, "")
+                    r.text.isNotEmpty() -> ChatMessage(Role.Assistant, r.text, tps = r.tps, modelName = _modelName.value)
+                    r.rc < 0            -> ChatMessage(Role.Assistant, "⚠️ ${Rc.message(r.rc)}")
+                    else                -> ChatMessage(Role.Assistant, "")
                 }
             } catch (c: kotlinx.coroutines.CancellationException) {
-                if (sb.isNotEmpty()) _messages.value = _messages.value + ChatMessage(Role.Assistant, sb.toString())
+                if (sb.isNotEmpty()) _messages.value = _messages.value +
+                    ChatMessage(Role.Assistant, sb.toString(), tps = _lastDecodeTps.value, modelName = _modelName.value)
                 throw c
             } catch (e: Exception) {
                 _messages.value = _messages.value + ChatMessage(Role.Assistant, "⚠️ ${e.message}")
@@ -312,6 +448,92 @@ class InferenceService : Service() {
                 updateNotification()
             }
         }
+    }
+
+    /**
+     * Multi-response: load each selected model in turn and let it answer the same
+     * prompt, appending one labeled reply per model. Sequential (load→answer→next)
+     * rather than co-resident, which is far safer for RAM on a phone.
+     */
+    private fun submitMulti(text: String, paths: List<String>, attachments: List<Attachment> = emptyList()) {
+        val convo = _messages.value + ChatMessage(Role.User, text, attachments = attachments)
+        _messages.value = convo
+        persistCurrent()
+        _status.value = Status.Generating
+        acquireWakeLock()
+        updateNotification()
+
+        genJob = serviceScope.launch {
+            try {
+                paths.forEachIndexed { index, path ->
+                    _multiRemaining.value = paths.size - index - 1
+                    val label = modelShortLabel(path)
+                    _streamingModelName.value = label
+                    _streamingText.value = ""
+                    if (!ensureLoaded(path)) {
+                        _messages.value = _messages.value +
+                            ChatMessage(Role.Assistant, "⚠️ Couldn't load $label", modelName = label)
+                        return@forEachIndexed
+                    }
+                    val sb = StringBuilder()
+                    val r = streamOnce(handle, buildRequestJson(convo), sb)
+                    _streamingText.value = ""
+                    _messages.value = _messages.value + when {
+                        r.text.isNotEmpty() -> ChatMessage(Role.Assistant, r.text, tps = r.tps, modelName = label)
+                        r.rc < 0            -> ChatMessage(Role.Assistant, "⚠️ ${Rc.message(r.rc)}", modelName = label)
+                        else                -> ChatMessage(Role.Assistant, "", modelName = label)
+                    }
+                }
+            } catch (c: kotlinx.coroutines.CancellationException) {
+                if (_streamingText.value.isNotEmpty()) _messages.value = _messages.value +
+                    ChatMessage(Role.Assistant, _streamingText.value, modelName = _streamingModelName.value)
+                throw c
+            } catch (e: Exception) {
+                _messages.value = _messages.value + ChatMessage(Role.Assistant, "⚠️ ${e.message}")
+            } finally {
+                _streamingText.value = ""
+                _streamingModelName.value = null
+                _multiRemaining.value = 0
+                persistCurrent()
+                _status.value = if (handle > 0L) Status.Ready else Status.Idle
+                releaseWakeLock()
+                updateNotification()
+            }
+        }
+    }
+
+    /** Loads [path] if it isn't already the active model. Returns true on success. */
+    private suspend fun ensureLoaded(path: String): Boolean {
+        if (_activeModelPath.value == path && handle != 0L) return true
+        _loadProgress.value = 0f
+        val rc = withContext(Dispatchers.Default) {
+            val old = handle
+            if (old != 0L) { handle = 0L; runCatching { NativeBridge.freeModel(old) } }
+            runCatching {
+                NativeBridge.loadModel(
+                    path = path, nCtx = DEFAULT_CTX, nThreads = DEFAULT_THREADS,
+                    nThreadsBatch = DEFAULT_THREADS_BATCH, nGpuLayers = 0,
+                    useMlock = _maximizeMemory.value,
+                    progress = { p -> _loadProgress.value = p },
+                )
+            }.getOrElse { -1L }
+        }
+        return if (rc > 0L) {
+            handle = rc
+            modelPath = path
+            _activeModelPath.value = path
+            _loadProgress.value = 1f
+            _modelName.value = modelShortLabel(path)
+            true
+        } else { handle = 0L; false }
+    }
+
+    /** A friendly short label for a model path (GGUF name if present, else file stem). */
+    fun modelShortLabel(path: String?): String {
+        if (path == null) return "No model"
+        val entry = _models.value.find { it.path == path }
+        val desc = entry?.info?.desc
+        return if (!desc.isNullOrBlank()) desc else File(path).name.removeSuffix(".gguf")
     }
 
     fun cancelGeneration() {
@@ -376,12 +598,134 @@ class InferenceService : Service() {
         serviceScope.launch { store.save(_conversations.value) }
     }
 
+    // ---- Device analytics ---------------------------------------------------
+
+    fun setAnalyticsEnabled(on: Boolean) {
+        _analyticsEnabled.value = on
+        settingsStore.analyticsEnabled = on
+        analyticsJob?.cancel()
+        if (on) {
+            analytics.resetCpuBaseline()
+            analyticsJob = serviceScope.launch {
+                // First reading after a reset baseline; then steady 1.5s cadence.
+                _deviceStats.value = withContext(Dispatchers.Default) { analytics.sample() }
+                while (isActive) {
+                    delay(1500)
+                    _deviceStats.value = withContext(Dispatchers.Default) { analytics.sample() }
+                }
+            }
+        } else {
+            _deviceStats.value = null
+        }
+    }
+
+    // ---- Saved replies ------------------------------------------------------
+
+    fun isSaved(messageId: String): Boolean = _savedReplies.value.any { it.messageId == messageId }
+
+    fun toggleSaved(message: ChatMessage) {
+        val already = isSaved(message.id)
+        _savedReplies.value = if (already) {
+            _savedReplies.value.filter { it.messageId != message.id }
+        } else {
+            val clean = message.text.replace(Regex("[*`#]+"), " ").replace(Regex("\\s+"), " ").trim()
+            listOf(SavedReply(message.id, clean, currentId, currentTitle())) + _savedReplies.value
+        }
+        serviceScope.launch { savedStore.save(_savedReplies.value) }
+    }
+
+    fun removeSaved(messageId: String) {
+        _savedReplies.value = _savedReplies.value.filter { it.messageId != messageId }
+        serviceScope.launch { savedStore.save(_savedReplies.value) }
+    }
+
+    private fun currentTitle(): String =
+        _conversations.value.find { it.id == currentId }?.title
+            ?: _messages.value.firstOrNull { it.role == Role.User }?.let { ConversationStore.titleFrom(it.text) }
+            ?: "New chat"
+
+    // ---- Experimental features ----------------------------------------------
+
+    fun setExperimentalEnabled(on: Boolean) {
+        _experimentalEnabled.value = on
+        settingsStore.experimentalEnabled = on
+        if (!on) {
+            // Turning the master switch off disables everything it gates.
+            setMaximizeMemory(false)
+            setMultiResponse(false)
+        }
+    }
+
+    fun setMaximizeMemory(on: Boolean) {
+        val v = on && _experimentalEnabled.value
+        _maximizeMemory.value = v
+        settingsStore.maximizeMemory = v
+    }
+
+    fun setMultiResponse(on: Boolean) {
+        val v = on && _experimentalEnabled.value
+        _multiResponse.value = v
+        settingsStore.multiResponse = v
+        if (!v) _multiSelectedPaths.value = emptyList()
+    }
+
+    fun setMultiSelected(paths: List<String>) { _multiSelectedPaths.value = paths }
+
+    /**
+     * RAM budget (GB) for loading models: free RAM minus a 1GB safety reserve,
+     * or all free RAM when Maximize memory allocation is on.
+     */
+    fun ramBudgetGb(): Double {
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        val freeGb = DeviceMemory.availableBytes(am) / 1e9
+        return if (_maximizeMemory.value) maxOf(0.0, freeGb) else maxOf(0.0, freeGb - 1.0)
+    }
+
+    /** Live free RAM in bytes (kernel MemAvailable) for UI panels that refresh. */
+    fun freeRamBytes(): Long =
+        DeviceMemory.availableBytes(getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager)
+
+    // ---- Export -------------------------------------------------------------
+
+    /** Serializes a conversation to [format] and returns the file (in cacheDir/exports). */
+    fun exportConversation(conversationId: String, format: ExportFormat): File? {
+        val convo = _conversations.value.find { it.id == conversationId }
+            ?: if (conversationId == currentId) Conversation(currentId, currentTitle(), _messages.value) else return null
+        return runCatching { ChatExporter.export(this, convo, format) }.getOrNull()
+    }
+
+    fun currentConversationSnapshot(): Conversation =
+        Conversation(currentId, currentTitle(), _messages.value)
+
+    /**
+     * The text handed to the engine for a message, with attachment context folded
+     * in: text-like files are inlined (truncated) so a text model can use them;
+     * images/binaries become a labelled note. (True pixel-level vision needs the
+     * native mtmd/mmproj path, which this text-only engine build doesn't include.)
+     */
+    private fun promptContent(m: ChatMessage): String {
+        if (m.attachments.isEmpty()) return m.text
+        val sb = StringBuilder(m.text)
+        m.attachments.forEach { a ->
+            when {
+                AttachmentUtil.isTextLike(a) -> {
+                    val body = AttachmentUtil.readTextForPrompt(a)
+                    sb.append("\n\n[Attached file: ${a.name}]")
+                    if (body != null) sb.append('\n').append(body)
+                }
+                AttachmentUtil.isImage(a) -> sb.append("\n\n[Attached image: ${a.name}]")
+                else -> sb.append("\n\n[Attached file: ${a.name}]")
+            }
+        }
+        return sb.toString().trim()
+    }
+
     private fun buildRequestJson(convo: List<ChatMessage>): String {
         val arr = JSONArray()
         if (systemPrompt.isNotBlank()) {
             arr.put(JSONObject().put("role", Role.System.wire).put("content", systemPrompt))
         }
-        convo.forEach { m -> arr.put(JSONObject().put("role", m.role.wire).put("content", m.text)) }
+        convo.forEach { m -> arr.put(JSONObject().put("role", m.role.wire).put("content", promptContent(m))) }
         val p = genParams
         val params = JSONObject()
             .put("maxTokens", p.maxTokens).put("temperature", p.temperature.toDouble())

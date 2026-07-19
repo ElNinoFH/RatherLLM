@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -81,26 +82,30 @@ private fun CodeBlock(code: String, lang: String) {
     val clipboard = LocalClipboardManager.current
     var copied by remember { mutableStateOf(false) }
     Surface(
-        color = MaterialTheme.colorScheme.surfaceContainerHighest,
-        shape = RoundedCornerShape(10.dp),
+        color = AppColors.CodeBg,
+        shape = RoundedCornerShape(12.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, AppColors.cream(0.09f)),
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column {
             Row(
-                Modifier.fillMaxWidth().padding(start = 12.dp, top = 2.dp, end = 4.dp),
+                Modifier
+                    .fillMaxWidth()
+                    .padding(start = 12.dp, top = 2.dp, end = 4.dp),
                 verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Text(
-                    lang.ifBlank { "code" },
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    lang.ifBlank { "code" }.uppercase(),
+                    style = AppText.MetaTiny,
+                    color = AppColors.TextFaint,
                 )
                 IconButton(onClick = { clipboard.setText(AnnotatedString(code)); copied = true }) {
                     Icon(
                         if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
                         contentDescription = "Copy code",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        tint = AppColors.TextMuted,
+                        modifier = Modifier.size(15.dp),
                     )
                 }
             }
@@ -108,8 +113,9 @@ private fun CodeBlock(code: String, lang: String) {
                 Text(
                     code,
                     fontFamily = FontFamily.Monospace,
-                    fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.onSurface,
+                    fontSize = 12.sp,
+                    lineHeight = 18.sp,
+                    color = AppColors.CodeText,
                 )
             }
         }

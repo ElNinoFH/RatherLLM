@@ -8,6 +8,15 @@
     <!-- Model downloads from a direct URL (e.g. Hugging Face resolve links). -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Package visibility (Android 11+): lets us resolve a camera app for the
+         "Take photo" attachment action. No CAMERA permission is declared, so the
+         system camera app handles capture and returns the photo to us. -->
+    <queries>
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -20,12 +29,40 @@
 
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Lets the user open a downloaded .gguf directly from Files/Downloads
+                 ("Open with" / "Share"), bypassing the SAF picker's activity-result path.
+                 No pathPattern: content:// URIs from third-party FileProvider authorities
+                 (e.g. Files by Google) use opaque paths that don't preserve the filename,
+                 and .gguf has no registered MIME type, so scheme+wildcard type is as
+                 narrow as this can practically be. The importer validates the GGUF magic
+                 header, so a mis-picked file is rejected cleanly rather than corrupting state. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
         </activity>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <service
             android:name=".InferenceService"

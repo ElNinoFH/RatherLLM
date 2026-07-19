@@ -60,6 +60,8 @@ data class ModelEntry(
 class ModelRepository(private val context: Context) {
 
     val modelsDir: File = File(context.filesDir, "models").apply { mkdirs() }
+    /** Vision/multimodal projector files live apart so they're never listed as models. */
+    val mmprojDir: File = File(context.filesDir, "mmproj").apply { mkdirs() }
     private val legacyModel: File = File(context.filesDir, "model.gguf")
 
     /** Total physical RAM of the device in bytes. */
@@ -159,6 +161,51 @@ class ModelRepository(private val context: Context) {
         }
     }
 
+    /**
+     * Copies a SAF [uri] holding a vision projector (mmproj) GGUF into `mmproj/`,
+     * validating the GGUF magic. Returns the stored file so its name can be paired
+     * with a model in [ModelMeta.mmproj].
+     */
+    suspend fun importMmproj(uri: Uri): Result<File> = withContext(Dispatchers.IO) {
+        val (queriedName, _) = queryDocument(uri)
+        val baseName = (queriedName ?: "mmproj_${System.currentTimeMillis()}.gguf")
+            .let { if (it.endsWith(".gguf", true)) it else "$it.gguf" }
+            .replace(Regex("[^A-Za-z0-9._-]"), "_")
+        val dest = uniqueIn(mmprojDir, baseName)
+        val tmp = File(dest.parentFile, "${dest.name}.part")
+        try {
+            val input = context.contentResolver.openInputStream(uri)
+                ?: return@withContext Result.failure(IllegalStateException("Can't open the selected file"))
+            input.use { ins ->
+                tmp.outputStream().use { out ->
+                    val buf = ByteArray(1 shl 20)
+                    var validated = false
+                    while (true) {
+                        currentCoroutineContext().ensureActive()
+                        val n = ins.read(buf)
+                        if (n < 0) break
+                        if (!validated) {
+                            if (n < 4 || buf[0] != 'G'.code.toByte() || buf[1] != 'G'.code.toByte() ||
+                                buf[2] != 'U'.code.toByte() || buf[3] != 'F'.code.toByte()
+                            ) {
+                                return@withContext Result.failure(
+                                    IllegalArgumentException("Not a GGUF projector file (bad magic header)")
+                                )
+                            }
+                            validated = true
+                        }
+                        out.write(buf, 0, n)
+                    }
+                }
+            }
+            if (!tmp.renameTo(dest)) { tmp.copyTo(dest, overwrite = true); tmp.delete() }
+            Result.success(dest)
+        } catch (t: Throwable) {
+            runCatching { tmp.delete() }
+            Result.failure(t)
+        }
+    }
+
     fun delete(file: File): Boolean = runCatching { file.delete() }.getOrDefault(false)
 
     /** Moves the legacy `filesDir/model.gguf` into `models/` if present. Returns the new file or null. */
@@ -169,13 +216,15 @@ class ModelRepository(private val context: Context) {
         else runCatching { legacyModel.copyTo(dest, overwrite = true).also { legacyModel.delete() } }.getOrNull()
     }
 
-    private fun uniqueFile(name: String): File {
-        var candidate = File(modelsDir, name)
+    private fun uniqueFile(name: String): File = uniqueIn(modelsDir, name)
+
+    private fun uniqueIn(dir: File, name: String): File {
+        var candidate = File(dir, name)
         if (!candidate.exists()) return candidate
         val stem = name.substringBeforeLast('.')
         val ext = name.substringAfterLast('.', "gguf")
         var i = 1
-        while (candidate.exists()) { candidate = File(modelsDir, "${stem}_$i.$ext"); i++ }
+        while (candidate.exists()) { candidate = File(dir, "${stem}_$i.$ext"); i++ }
         return candidate
     }
 }
